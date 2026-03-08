@@ -614,6 +614,27 @@ class ZoomCanvas(tk.Canvas):
     def _reset_view(self, event=None):
         self._fit_to_canvas()
 
+    def get_viewport_image_rect(self) -> Optional[Tuple[int,int,int,int]]:
+        """
+        현재 화면에 보이는 이미지 영역을 이미지 좌표(픽셀)로 반환.
+        Returns: (x1, y1, x2, y2) or None if no image loaded
+        """
+        if self._pil_orig is None:
+            return None
+        cw = self.winfo_width()
+        ch = self.winfo_height()
+        if cw < 10 or ch < 10:
+            return None
+        iw, ih = self._pil_orig.size
+        sc = self._scale
+        ox = self._offset_x
+        oy = self._offset_y
+        x1 = max(0, int(-ox / sc))
+        y1 = max(0, int(-oy / sc))
+        x2 = min(iw, int((cw - ox) / sc) + 1)
+        y2 = min(ih, int((ch - oy) / sc) + 1)
+        return (x1, y1, x2, y2)
+
 
 # ──────────────────────────────────────────────────────────
 # 메인 앱
@@ -777,30 +798,56 @@ class DroneApp(tk.Tk):
         self.sl_sensitivity = self._slider(p, "탐지 민감도",   0.1, 1.0, 0.45)
         self.sl_feather     = self._slider(p, "마스크 페더링", 3,   50,  20, fmt=".0f")
 
-        # ── 색상 복원 설정 (v6.0)
-        self._section(p, "그림자 색상+밝기 복원")
+        # ── 색상 복원 설정 (v7.0 Shadow / Highlight 분리)
+        self._section(p, "Shadow  (그림자 밝게 + 색상 복원)")
         self.use_ai_color = tk.BooleanVar(value=True)
         tk.Checkbutton(p, text="AI 미세 보정 (모델 로드 시 활성)",
                         variable=self.use_ai_color,
+                        command=self._on_param_change,
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
         self.use_hue_consist = tk.BooleanVar(value=True)
         tk.Checkbutton(p, text="Hue 기반 정밀 색상 복원 (권장)",
                         variable=self.use_hue_consist,
+                        command=self._on_param_change,
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
 
-        self.sl_radio    = self._slider(p, "색상+밝기 복원 강도", 0.3, 1.0, 0.90)
-        self.sl_highlight = self._slider(p, "Highlight 보호",     0.0, 0.6, 0.25)
+        self.sl_shadow   = self._slider(p, "Shadow 복원 강도",  0.0, 1.0, 0.85)
+        self._bind_slider_live(self.sl_shadow)
+
+        self._section(p, "Highlight  (밝은 영역 텍스처 복원)")
+        self.sl_highlight = self._slider(p, "Highlight 복원 강도", 0.0, 1.0, 0.40)
+        self._bind_slider_live(self.sl_highlight)
 
         # ── 영상 품질 개선
         self._section(p, "영상 품질 개선")
-        self.sl_denoise = self._slider(p, "노이즈 제거",     1,   12,  5,   fmt=".0f")
-        self.sl_sharpen = self._slider(p, "선명도",          0.0, 2.0, 0.8)
-        self.sl_clahe   = self._slider(p, "CLAHE 로컈대비",  0.5, 4.0, 2.0)
+        self.sl_denoise = self._slider(p, "노이즈 제거",     1,   12,  4,   fmt=".0f")
+        self.sl_sharpen = self._slider(p, "선명도",          0.0, 2.0, 0.7)
+        self.sl_clahe   = self._slider(p, "CLAHE 로컬대비",  0.5, 4.0, 2.0)
+        self._bind_slider_live(self.sl_denoise)
+        self._bind_slider_live(self.sl_sharpen)
+        self._bind_slider_live(self.sl_clahe)
+
+        # 슬라이더 실시간 딜레이 (ms)
+        self._live_delay_ms = 600   # 마지막 조작 후 600ms 뒤 자동 미리보기
+        self._live_timer_id = None  # after() ID
+        self._live_roi_mode = True  # True=보이는영역만, False=전체
 
         # ── 실행 버튼
         self._section(p, "")
+
+        # 실시간/ROI 모드 토글
+        self._live_roi_var = tk.BooleanVar(value=True)
+        roi_row = tk.Frame(p, bg=DARK)
+        roi_row.pack(fill="x", padx=10, pady=(2,0))
+        tk.Checkbutton(roi_row, text="슬라이더 실시간 미리보기",
+                        variable=self._live_roi_var,
+                        bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
+                        font=("Segoe UI", 8)).pack(side="left")
+        tk.Label(roi_row, text="(보이는영역만)", bg=DARK, fg=TEXT2,
+                  font=("Segoe UI", 7)).pack(side="left", padx=2)
+
         self.btn_preview = FlatButton(
             p, "선택 이미지 미리보기 (재처리)",
             command=self._preview_selected,
@@ -809,7 +856,7 @@ class DroneApp(tk.Tk):
         self.btn_preview.pack(pady=(4, 2), padx=10)
 
         tk.Label(p,
-                  text="더블클릭=즉시처리  |  슬라이더 조정 후 이 버튼으로 재처리",
+                  text="더블클릭=즉시처리  |  슬라이더 조정 시 자동 실시간 반영",
                   bg=DARK, fg=WARN, font=("Segoe UI", 7)).pack(padx=12, anchor="w")
 
         ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=6)
@@ -937,6 +984,61 @@ class DroneApp(tk.Tk):
         s = LabeledSlider(parent, label, lo, hi, init, fmt=fmt, padx=10, pady=2)
         s.pack(fill="x", padx=10, pady=1)
         return s
+
+    def _bind_slider_live(self, slider_widget):
+        """슬라이더 변경 시 실시간 미리보기 예약."""
+        slider_widget.var.trace_add("write", lambda *_: self._on_param_change())
+
+    def _on_param_change(self):
+        """파라미터 변경 시 실시간 미리보기 예약 (debounce 600ms)."""
+        if not hasattr(self, '_live_roi_var'):
+            return
+        if not self._live_roi_var.get():
+            return
+        if not self._selected_path or not os.path.isfile(self._selected_path):
+            return
+        if not hasattr(self, '_cur_orig') or self._cur_orig is None:
+            return
+        # 이전 예약 취소
+        if hasattr(self, '_live_timer_id') and self._live_timer_id is not None:
+            try: self.after_cancel(self._live_timer_id)
+            except Exception: pass
+        self._live_timer_id = self.after(600, self._live_preview_roi)
+
+    def _live_preview_roi(self):
+        """보이는 영역만 즉시 처리하여 실시간 미리보기 반영."""
+        self._live_timer_id = None
+        if self._is_previewing:
+            return
+        if self._cur_orig is None:
+            return
+
+        # 현재 보이는 ROI 좌표 가져오기
+        roi = None
+        if hasattr(self, 'zoom_right') and self.zoom_right.get_viewport_image_rect():
+            roi = self.zoom_right.get_viewport_image_rect()
+        elif hasattr(self, 'zoom_single') and self.zoom_single.get_viewport_image_rect():
+            roi = self.zoom_single.get_viewport_image_rect()
+
+        params = self._collect_params()
+        params['roi_rect'] = roi
+        params['preview_mode'] = True
+        img = self._cur_orig
+
+        self._is_previewing = True
+
+        def _work():
+            try:
+                result, binary, soft, stats = process_single(img, **params)
+                self._queue.put(("preview_done",
+                                  img, result, binary, soft, stats,
+                                  os.path.basename(self._selected_path)))
+            except Exception as e:
+                import traceback
+                self._queue.put(("preview_error",
+                                  f"실시간 미리보기 오류: {e}\n{traceback.format_exc()[:400]}"))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _chk(self, parent, text, var):
         tk.Checkbutton(parent, text=text, variable=var, bg=DARK, fg=TEXT,
@@ -1424,21 +1526,23 @@ class DroneApp(tk.Tk):
             "detection_mode":         self.detect_mode.get(),
             "sensitivity":            float(self.sl_sensitivity.get()),
             "feather":                int(self.sl_feather.get()),
-            # v6.0 색상 복원 파라미터
-            "color_restore_strength": float(self.sl_radio.get()),
+            # v7.0 Shadow / Highlight 분리 파라미터
+            "shadow_strength":        float(self.sl_shadow.get()),
+            "highlight_strength":     float(self.sl_highlight.get()),
             "use_hue_consistent":     bool(self.use_hue_consist.get()),
-            "highlight_protect":      float(self.sl_highlight.get()),
             "use_ai_color":           bool(self.use_ai_color.get()),
             # 품질 개선
             "denoise_h":              int(self.sl_denoise.get()),
             "sharpen_amount":         float(self.sl_sharpen.get()),
             "clahe_clip":             float(self.sl_clahe.get()),
             # 하위 호환성
-            "shadow_amount":          float(self.sl_radio.get()),
+            "color_restore_strength": float(self.sl_shadow.get()),
+            "highlight_protect":      float(self.sl_highlight.get()) * 0.4,
+            "shadow_amount":          float(self.sl_shadow.get()),
             "highlight_amount":       float(self.sl_highlight.get()),
-            "radio_strength":         float(self.sl_radio.get()),
+            "radio_strength":         float(self.sl_shadow.get()),
             "retinex_strength":       0.0,
-            "shadow_lift":            0.20,
+            "shadow_lift":            0.15,
             "blur_radius":            60,
         }
 

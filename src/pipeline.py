@@ -114,33 +114,38 @@ def process_single(
     detection_mode: str   = 'hybrid',
     sensitivity: float    = 0.45,
     feather: int          = 20,
-    # v6.0 색상 복원 핵심 파라미터
-    color_restore_strength: float = 0.90,  # per-channel gain 복원 강도 (0~1)
-    use_hue_consistent: bool      = True,  # Hue 기반 정밀 gain 사용
-    highlight_protect: float      = 0.25,  # 하이라이트 압축
+    # v7.0 Shadow / Highlight 분리 파라미터
+    shadow_strength: float        = 0.85,  # 그림자 밝기+색상 복원 강도
+    highlight_strength: float     = 0.40,  # 밝은 영역 텍스처 복원 강도
+    use_hue_consistent: bool      = True,  # Hue 기반 정밀 색상 복원
     use_ai_color: bool            = True,
     # 품질 개선
     denoise_h: int                = 4,
-    sharpen_amount: float         = 0.8,
+    sharpen_amount: float         = 0.7,
     clahe_clip: float             = 2.0,
     # 하위 호환성 (GUI 구버전 슬라이더 대응)
+    color_restore_strength: float = 0.85,
+    highlight_protect: float      = 0.25,
     shadow_amount: float          = 0.70,
     highlight_amount: float       = 0.20,
     midtone_contrast: float       = 0.15,
     color_strength: float         = 0.35,
     radio_strength: float         = 0.70,
     retinex_strength: float       = 0.0,
-    shadow_lift: float            = 0.30,
+    shadow_lift: float            = 0.20,
     blur_radius: int              = 60,
+    # ROI 처리 (실시간 미리보기)
+    roi_rect: Optional[Tuple[int,int,int,int]] = None,
     # 처리 모드
     preview_mode: bool            = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
-    단일 이미지 처리.
+    단일 이미지 처리 v7.0.
     Returns: (result_bgr, binary_mask, soft_mask, stats_dict)
 
     preview_mode=True  : PREVIEW_MAX_PX 이하로 처리 후 원본 크기로 upscale 반환
     preview_mode=False : 원본 해상도 그대로 처리
+    roi_rect: (x1,y1,x2,y2) — None이면 전체 처리, 지정시 해당 영역만 처리
     """
     stats  = {}
     orig_h, orig_w = img_bgr.shape[:2]
@@ -149,6 +154,14 @@ def process_single(
     max_px   = PREVIEW_MAX_PX if preview_mode else BATCH_MAX_PX
     work_img, scale = _resize_for_processing(img_bgr, max_px)
     wh, ww = work_img.shape[:2]
+
+    # roi_rect를 작업 해상도로 변환
+    work_roi = None
+    if roi_rect is not None and scale < 1.0:
+        x1, y1, x2, y2 = roi_rect
+        work_roi = (int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale))
+    elif roi_rect is not None:
+        work_roi = roi_rect
 
     # ── 1. 그림자 탐지 (work 해상도)
     t0 = time.perf_counter()
@@ -166,29 +179,31 @@ def process_single(
     stats['detect_ms']    = stats['detection_ms']
     stats['shadow_pct']   = round(float((binary > 0).sum()) / max(wh * ww, 1) * 100, 1)
 
-    # ── 2. 색상 복원 (work 해상도에서 처리)
+    # ── 2. 색상 복원 (v7.0: Shadow/Highlight 완전 분리)
     t0 = time.perf_counter()
     ai_model = _color_model if use_ai_color else None
+
+    # 하위 호환성: 구버전 파라미터 병합
+    eff_shadow    = max(shadow_strength, color_restore_strength, shadow_amount * 0.9)
+    eff_highlight = max(highlight_strength, highlight_protect * 1.5)
+
     try:
-        result = restore_shadow_color(
+        from color_restoration import process_roi as _process_roi
+        result = _process_roi(
             work_img, soft,
-            color_restore_strength = color_restore_strength,
-            use_hue_consistent     = use_hue_consistent,
-            highlight_protect      = highlight_protect,
-            ai_model               = ai_model,
-            device                 = _device,
-            denoise_h              = denoise_h,
-            sharpen_amount         = sharpen_amount,
-            clahe_clip             = clahe_clip,
-            # 하위 호환성 전달
-            shadow_amount          = shadow_amount,
-            highlight_amount       = highlight_amount,
-            radio_strength         = radio_strength,
-            shadow_lift            = shadow_lift,
-            blur_radius            = blur_radius,
+            roi_rect           = work_roi,
+            shadow_strength    = min(eff_shadow, 1.0),
+            highlight_strength = eff_highlight,
+            use_hue_consistent = use_hue_consistent,
+            ai_model           = ai_model,
+            device             = _device,
+            denoise_h          = denoise_h,
+            sharpen_amount     = sharpen_amount,
+            clahe_clip         = clahe_clip,
         )
     except Exception as e:
         print(f"Color restoration error: {e}")
+        import traceback; traceback.print_exc()
         result = work_img.copy()
 
     stats['restoration_ms'] = round((time.perf_counter() - t0) * 1000, 1)
