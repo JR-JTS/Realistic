@@ -111,14 +111,14 @@ def _resize_for_processing(img: np.ndarray, max_px: int):
 def process_single(
     img_bgr: np.ndarray,
     # 탐지
-    detection_mode: str   = 'cv',
+    detection_mode: str   = 'hybrid',
     sensitivity: float    = 0.45,
     feather: int          = 20,
     # 복원
     radio_strength: float    = 0.70,
     color_strength: float    = 0.55,
     retinex_strength: float  = 0.20,
-    use_ai_color: bool       = False,
+    use_ai_color: bool       = True,
     # 선명화
     denoise_h: int           = 4,
     sharpen_amount: float    = 1.0,

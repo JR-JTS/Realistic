@@ -766,7 +766,7 @@ class DroneApp(tk.Tk):
 
         # ── 탐지 설정
         self._section(p, "그림자 탐지")
-        self.detect_mode = tk.StringVar(value="cv")
+        self.detect_mode = tk.StringVar(value="hybrid")
         dm_f = tk.Frame(p, bg=DARK)
         dm_f.pack(fill="x", padx=10, pady=4)
         for txt, val in [("AI+CV 복합", "hybrid"), ("CV 방법만", "cv")]:
@@ -779,7 +779,7 @@ class DroneApp(tk.Tk):
 
         # ── 색상 복원 설정
         self._section(p, "색상 복원")
-        self.use_ai_color = tk.BooleanVar(value=False)
+        self.use_ai_color = tk.BooleanVar(value=True)
         tk.Checkbutton(p, text="AI 색상 보정 (모델 로드 시 활성)",
                         variable=self.use_ai_color,
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
@@ -1517,6 +1517,11 @@ class DroneApp(tk.Tk):
                     parts.append("복원AI " + ("OK" if st.get("color")  else "CV모드"))
                     txt = "  |  ".join(parts)
                     self.model_badge.config(text=txt, fg=GREEN)
+                    # 모델 로드 성공 시 자동으로 AI 모드 활성화
+                    if st.get("shadow"):
+                        self.detect_mode.set("hybrid")
+                    if st.get("color"):
+                        self.use_ai_color.set(True)
                     self._set_status("준비 완료 — 폴더 선택 후 파일 더블클릭으로 즉시 처리", GREEN)
                     self._log(f"모델 로드: {txt}", "ok")
 
