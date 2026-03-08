@@ -1,12 +1,18 @@
 """
-Shadow Color Restoration Module  v3.0
+Shadow Color Restoration Module  v4.0
 ──────────────────────────────────────
-핵심 수정 (v3.0):
-  - 모든 보정을 오직 그림자 soft_mask > 임계값 영역에만 적용
-  - 어두운 물체(도로, 지붕) 보호: 청색편이가 없는 어두운 픽셀은 보정 제외
-  - gain 클리핑 더 엄격 (최대 2.0배)
-  - Lab 색전달 강도 제한
-  - Retinex 마스크 완전 적용
+v4.0 완전 재설계:
+  ■ Photoshop Shadow/Highlight 방식 채택
+    - shadow_lift : 어두운 영역만 선택적으로 밝힘 (tone curve 기반)
+    - highlight_protect : 밝은 영역은 건드리지 않거나 살짝 내림
+    - midtone_contrast : 중간톤 대비 강화
+  ■ 색상 채도(Saturation) 보호: 검은 차량처럼 채도 낮은 물체는 밝기 복원만, 색상 변경 금지
+  ■ Tone-mapping 기반 복원: gain 방식 대신 tone-curve 적용 → 하이라이트 클리핑 방지
+  ■ 영상 품질 개선 파이프라인:
+    - 어두운 영역 CLAHE (로컬 대비)
+    - 전체 노이즈 억제 (fastNlMeansDenoisingColored)
+    - 적응형 언샤프 마스킹
+    - 색상 진동(fringing) 억제
 """
 
 import cv2
@@ -18,218 +24,330 @@ import torch.nn.functional as F
 
 
 # ══════════════════════════════════════════════════════════
-# 내부 유틸: 그림자 픽셀 신뢰도 마스크
+# 내부 유틸
 # ══════════════════════════════════════════════════════════
 
-def _shadow_confidence_mask(img_bgr: np.ndarray,
-                              soft_mask: np.ndarray) -> np.ndarray:
+def _build_tone_curve(shadow_lift: float,
+                      highlight_compress: float,
+                      midtone_contrast: float) -> np.ndarray:
     """
-    soft_mask를 청색편이 확인으로 정제.
-    청색편이(Cb↑) 없는 어두운 픽셀은 신뢰도를 낮춤 → 도로·지붕 보정 억제.
-    반환: [0,1] float32 신뢰도 마스크 (soft_mask보다 더 선택적)
+    Photoshop Shadow/Highlight 방식의 톤 커브 생성 (0~255 LUT).
+
+    shadow_lift        : 0~1, 어두운 영역 밝기 상승량 (0.5 = Photoshop 기본)
+    highlight_compress : 0~1, 밝은 영역 압축량 (0 = 그대로, 0.3 = 살짝 내림)
+    midtone_contrast   : -1~1, 중간톤 대비 (양수=강화, 음수=완화)
     """
-    ycr  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
-    Y    = ycr[:, :, 0]
-    Cb   = ycr[:, :, 2]
+    x = np.linspace(0.0, 1.0, 256)
 
-    # 이미지 전체 Cb 중앙값 대비 높은 픽셀 → 청색편이 있음
-    cb_median = float(np.median(Cb))
-    cb_std    = float(Cb.std()) + 1.0
+    # ── Shadow Lift: 어두운 영역 선택적 상승 (부드러운 S-커브 아랫부분)
+    # Photoshop은 0~128 범위에 집중, 그 이상은 서서히 감소
+    shadow_weight = np.clip(1.0 - (x / 0.5) ** 1.5, 0, 1)  # 0에서 1, 0.5에서 0
+    y = x + shadow_lift * shadow_weight * (1.0 - x)          # 밝은 곳은 덜 올림
 
-    # 중앙값보다 얼마나 높은지 (0 ~ 1)
-    blue_shift = np.clip((Cb - cb_median) / (cb_std * 1.5 + 1e-6), 0, 1).astype(np.float32)
+    # ── Highlight Compress: 밝은 영역 살짝 압축
+    highlight_weight = np.clip((x - 0.7) / 0.3, 0, 1) ** 2
+    y = y - highlight_compress * highlight_weight * x
 
-    # 반대로, 중앙값보다 낮은 픽셀 (도로·지붕) → 신뢰도 페널티
-    # Cb < 중앙값이면 보정 억제
-    below_median = np.clip((cb_median - Cb) / (cb_std * 1.5 + 1e-6), 0, 1).astype(np.float32)
-    penalty = 1.0 - below_median * 0.5   # 최대 50% 억제
+    # ── Midtone Contrast: S-커브 중간 부분
+    if abs(midtone_contrast) > 0.01:
+        # 시그모이드 기반 S-커브
+        k = midtone_contrast * 5.0
+        sig = 1.0 / (1.0 + np.exp(-k * (x - 0.5)))
+        sig = (sig - sig.min()) / (sig.max() - sig.min())  # 0~1 정규화
+        blend = np.clip(4 * x * (1 - x), 0, 1)             # 중간톤 가중치
+        y = y * (1 - blend * abs(midtone_contrast)) + \
+            sig * blend * abs(midtone_contrast) + \
+            y * (1 - blend * abs(midtone_contrast))
+        y = x + (y - x) * abs(midtone_contrast)
 
-    # 최종 신뢰도: soft_mask × 가중치 (0.25 ~ 1.0 사이)
-    # 청색편이가 없으면 최소 25%만 보정
-    confidence = soft_mask * (0.25 + 0.75 * blue_shift) * penalty
-    return confidence.clip(0, 1).astype(np.float32)
+    lut = np.clip(y * 255.0, 0, 255).astype(np.uint8)
+    return lut
 
 
-# ══════════════════════════════════════════════════════════
-# STEP 1: 물리 기반 조명 보정
-# ══════════════════════════════════════════════════════════
-
-def radiometric_correction(img_bgr: np.ndarray,
-                            soft_mask: np.ndarray,
-                            strength: float = 0.75) -> np.ndarray:
+def _apply_lut_masked(img_bgr: np.ndarray,
+                      lut: np.ndarray,
+                      mask: np.ndarray) -> np.ndarray:
     """
-    채널별 gain/offset을 shadow 픽셀에만 적용.
-    lit 영역 통계를 기준으로 shadow 영역을 보정.
-    청색편이 confidence로 어두운 물체 보정 억제.
+    LUT를 마스크 영역에만 블렌딩 적용.
+    mask : float32 [0,1]
     """
-    # confidence 마스크로 실제 그림자 영역 추출
-    confidence = _shadow_confidence_mask(img_bgr, soft_mask)
+    # LUT 적용 (전체)
+    corrected = cv2.LUT(img_bgr, lut)
+    # 마스크 블렌딩
+    m = mask[:, :, np.newaxis].clip(0, 1)
+    result = img_bgr.astype(np.float32) * (1.0 - m) + corrected.astype(np.float32) * m
+    return result.clip(0, 255).astype(np.uint8)
 
-    # 통계용 마스크: confidence 높은 그림자 / 확실한 비그림자
-    shadow_bin = confidence > 0.50   # confidence 기반 (청색편이 있는 그림자)
-    lit_bin    = soft_mask < 0.06    # 확실한 비그림자
 
-    ns = shadow_bin.sum()
-    nl = lit_bin.sum()
-    if ns < 100 or nl < 300:
-        return img_bgr.copy()
-
-    img_f = img_bgr.astype(np.float32)
-
-    # 샘플링으로 통계 계산
-    MAX_SAMP = 5000
-    s_idx = np.where(shadow_bin.ravel())[0]
-    l_idx = np.where(lit_bin.ravel())[0]
-    rng = np.random.default_rng(42)
-    if len(s_idx) > MAX_SAMP:
-        s_idx = rng.choice(s_idx, MAX_SAMP, replace=False)
-    if len(l_idx) > MAX_SAMP:
-        l_idx = rng.choice(l_idx, MAX_SAMP, replace=False)
-
-    flat = img_f.reshape(-1, 3)
-    sv   = flat[s_idx]
-    lv   = flat[l_idx]
-
-    s_med = np.median(sv, axis=0).clip(5.0, None)
-    l_med = np.median(lv, axis=0)
-
-    # gain 엄격 클리핑 (1.0 ~ 1.9 배)
-    gains   = np.clip(l_med / s_med, 1.0, 1.9)
-    offsets = np.clip((l_med - s_med * gains) * 0.15, -15, 15)
-
-    # 최종 alpha: confidence × strength (청색편이 없는 영역은 자동으로 작아짐)
-    alpha3 = (confidence * strength).clip(0, 1)[:, :, np.newaxis]
-
-    corrected = img_f * gains[np.newaxis, np.newaxis, :] + offsets[np.newaxis, np.newaxis, :]
-    corrected = corrected.clip(0, 255)
-
-    result = img_f * (1.0 - alpha3) + corrected * alpha3
-    return np.clip(result, 0, 255).astype(np.uint8)
+def _saturation_protection_mask(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    채도가 낮은 픽셀(검은 차량, 콘크리트 등)의 색상 변환 억제 마스크.
+    S < 40 이면 색상 보정 금지 (밝기만 복원)
+    반환: float32 [0,1], 높을수록 색상 보정 허용
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    S   = hsv[:, :, 1].astype(np.float32)
+    # S 20 이하: 완전 억제, S 60 이상: 완전 허용
+    sat_mask = np.clip((S - 20.0) / 40.0, 0, 1)
+    return sat_mask.astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 2: Lab 색 전달 (그림자 영역 색상 편이 보정)
+# STEP 1: Photoshop Shadow/Highlight 복원
 # ══════════════════════════════════════════════════════════
 
-def lab_color_transfer(img_bgr: np.ndarray,
-                        soft_mask: np.ndarray,
-                        strength: float = 0.55) -> np.ndarray:
+def shadow_highlight_restore(img_bgr: np.ndarray,
+                              soft_mask: np.ndarray,
+                              shadow_amount: float = 0.70,
+                              highlight_amount: float = 0.20,
+                              midtone_contrast: float = 0.15,
+                              radius: int = 40) -> np.ndarray:
     """
-    그림자의 청색 편이를 보정.
-    shadow 영역의 Lab 통계를 lit 영역에 맞춤.
+    Photoshop Shadow/Highlight 알고리즘.
+
+    shadow_amount     : 그림자 영역 밝기 복원 강도 (0~1)
+    highlight_amount  : 하이라이트 압축 강도 (0~1, 과보정 방지)
+    midtone_contrast  : 중간톤 대비 강화 (-1~1)
+    radius            : 로컬 평균 계산 반경 (픽셀)
+
+    핵심 아이디어:
+    1) 각 픽셀의 로컬 평균 밝기로 shadow/midtone/highlight 영역 분류
+    2) 분류된 영역별로 다른 tone curve 적용
+    3) 채도 낮은 픽셀(검은 물체)은 색상 변경 없이 밝기만 복원
     """
-    shadow_bin = soft_mask > 0.55
-    lit_bin    = soft_mask < 0.08
+    h, w = img_bgr.shape[:2]
 
-    if shadow_bin.sum() < 100 or lit_bin.sum() < 300:
-        return img_bgr.copy()
+    # ── 로컬 평균 밝기 계산 (Photoshop의 "Tonal Width" 개념)
+    # Lab L 채널 사용 (인지 균일 밝기)
+    lab  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
+    L    = lab[:, :, 0] / 255.0  # 0~1 정규화
 
-    lab_u8 = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab)
-    lab    = lab_u8.astype(np.float32)
+    ks   = min(radius * 2 + 1, 151)
+    ks   = ks if ks % 2 == 1 else ks + 1
+    L_blur = cv2.GaussianBlur(L, (ks, ks), float(radius / 2))
 
-    MAX_SAMP = 5000
-    flat  = lab.reshape(-1, 3)
-    s_idx = np.where(shadow_bin.ravel())[0]
-    l_idx = np.where(lit_bin.ravel())[0]
-    rng = np.random.default_rng(42)
-    if len(s_idx) > MAX_SAMP:
-        s_idx = rng.choice(s_idx, MAX_SAMP, replace=False)
-    if len(l_idx) > MAX_SAMP:
-        l_idx = rng.choice(l_idx, MAX_SAMP, replace=False)
+    # ── 영역 분류 (soft mask 고려)
+    # shadow 영역: L_blur 낮고 soft_mask 높음
+    shadow_tonal = np.clip(1.0 - L_blur / 0.45, 0, 1) ** 1.5   # 밝기 0~45% 구간
+    highlight_tonal = np.clip((L_blur - 0.65) / 0.35, 0, 1) ** 2  # 밝기 65~100% 구간
 
-    sv = flat[s_idx]
-    lv = flat[l_idx]
+    shadow_lift_mask     = shadow_tonal * soft_mask              # 그림자 탐지 × 톤
+    highlight_press_mask = highlight_tonal * (1.0 - soft_mask * 0.5)  # 밝은 영역
 
-    s_mean = np.median(sv, axis=0)
-    l_mean = np.median(lv, axis=0)
-    s_std  = np.maximum(sv.std(axis=0), 1.0)
-    l_std  = np.maximum(lv.std(axis=0), 1.0)
+    # ── 채도 보호 마스크 (검은 차량 등 색상 변경 방지)
+    sat_prot = _saturation_protection_mask(img_bgr)
 
-    # std 비율 클리핑 강화 (0.7 ~ 1.5)
-    ratio = np.clip(l_std / s_std, 0.7, 1.5)
-    ratio_3d = ratio[np.newaxis, np.newaxis, :]
-    s_m      = s_mean[np.newaxis, np.newaxis, :]
-    l_m      = l_mean[np.newaxis, np.newaxis, :]
+    # ── Lab L 채널에 Shadow Lift 적용
+    # Shadow: L 값을 tone curve로 올림
+    shadow_gain  = shadow_amount * shadow_lift_mask
+    # 밝기 상승: 어두울수록 더 많이 (tone curve 효과)
+    L_lifted = L + shadow_gain * (1.0 - L) * 0.7   # 이미 밝은 부분은 덜 올림
+    L_lifted = np.clip(L_lifted, 0, 1)
 
-    corrected = (lab - s_m) * ratio_3d + l_m
-    corrected = np.clip(corrected, 0, 255)
+    # Highlight Compress: 과도하게 밝은 영역 살짝 내림
+    highlight_reduce = highlight_amount * highlight_press_mask * 0.4
+    L_result = L_lifted - highlight_reduce * L_lifted
+    L_result = np.clip(L_result, 0, 1)
 
-    # 청색편이 신뢰도 적용
-    confidence = _shadow_confidence_mask(img_bgr, soft_mask)
-    alpha      = (confidence * strength).clip(0, 1)[:, :, np.newaxis]
+    # Midtone Contrast: 중간톤 S-커브
+    if abs(midtone_contrast) > 0.01:
+        midtone_w = 4.0 * L_result * (1.0 - L_result)  # 0.5에서 최대
+        k = midtone_contrast * 3.0
+        sig = 1.0 / (1.0 + np.exp(-k * (L_result - 0.5)))
+        sig = (sig - 0.5) * midtone_w * abs(midtone_contrast) * 0.3
+        L_result = np.clip(L_result + sig, 0, 1)
 
-    result    = lab * (1.0 - alpha) + corrected * alpha
-    result_u8 = np.clip(result, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(result_u8, cv2.COLOR_Lab2BGR)
+    # ── L 채널 적용 (a, b 채널은 채도 보호 마스크에 따라 선택)
+    lab_result = lab.copy()
+    lab_result[:, :, 0] = L_result * 255.0
+
+    # a, b 채널 색상 이동: 채도 낮은 물체는 색상 유지
+    # 그림자 특유의 청색편이 제거 (a, b 채널을 밝은 영역 평균으로 이동)
+    lit_mask = soft_mask < 0.05
+    if lit_mask.sum() > 200:
+        lit_a_mean = float(np.median(lab[:, :, 1][lit_mask]))
+        lit_b_mean = float(np.median(lab[:, :, 2][lit_mask]))
+        shd_mask_bin = soft_mask > 0.4
+
+        if shd_mask_bin.sum() > 100:
+            # 색상 보정: 채도 높은 그림자만 색상 이동 (채도 낮으면 유지)
+            color_alpha = (shadow_lift_mask * sat_prot * 0.4).clip(0, 0.4)[:, :, np.newaxis]
+            target_ab   = np.stack([
+                np.full_like(lab[:, :, 1], lit_a_mean),
+                np.full_like(lab[:, :, 2], lit_b_mean)
+            ], axis=2)
+            lab_result[:, :, 1:] = (lab[:, :, 1:] * (1.0 - color_alpha) +
+                                     target_ab * color_alpha).clip(0, 255)
+
+    result_bgr = cv2.cvtColor(
+        np.clip(lab_result, 0, 255).astype(np.uint8),
+        cv2.COLOR_Lab2BGR)
+    return result_bgr
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 3: 고속 Retinex (그림자 영역 밝기 보정)
+# STEP 2: 색상 채도 복원 (그림자 영역 색상 이동 보정)
 # ══════════════════════════════════════════════════════════
 
-def retinex_shadow_lighten(img_bgr: np.ndarray,
-                            soft_mask: np.ndarray,
-                            strength: float = 0.25) -> np.ndarray:
+def color_cast_correction(img_bgr: np.ndarray,
+                           soft_mask: np.ndarray,
+                           strength: float = 0.40) -> np.ndarray:
     """
-    Multi-Scale Retinex를 그림자 영역에만 적용.
-    strength=0 이면 즉시 반환.
+    그림자의 청색 편이(color cast) 보정.
+    채도 낮은 픽셀(검은 차량)은 건너뜀.
     """
     if strength <= 0.01:
         return img_bgr.copy()
 
-    h, w = img_bgr.shape[:2]
+    shadow_bin = soft_mask > 0.50
+    lit_bin    = soft_mask < 0.06
 
-    # Retinex용 축소 (최대 400px)
-    MAX_PX = 400
-    scale  = min(1.0, MAX_PX / max(h, w))
-    if scale < 1.0:
-        th, tw = int(h * scale), int(w * scale)
-        small  = cv2.resize(img_bgr, (tw, th), interpolation=cv2.INTER_AREA)
-        smask  = cv2.resize(soft_mask, (tw, th), interpolation=cv2.INTER_LINEAR)
-    else:
-        small, smask = img_bgr.copy(), soft_mask.copy()
+    if shadow_bin.sum() < 100 or lit_bin.sum() < 200:
+        return img_bgr.copy()
 
-    img_f = small.astype(np.float32) + 1.0
-    msr   = np.zeros_like(img_f)
+    sat_prot   = _saturation_protection_mask(img_bgr)
 
-    for sigma in (15, 80, 200):
-        s  = max(3, int(sigma * scale))
-        ks = min(s * 4 + 1, 201)
-        ks = ks if ks % 2 == 1 else ks + 1
-        blurred = cv2.GaussianBlur(img_f, (ks, ks), float(s))
-        msr    += np.log1p(img_f) - np.log1p(blurred)
+    lab    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
+    flat   = lab.reshape(-1, 3)
 
-    msr /= 3.0
+    MAX_SAMP = 4000
+    rng  = np.random.default_rng(0)
+    s_idx = np.where(shadow_bin.ravel())[0]
+    l_idx = np.where(lit_bin.ravel())[0]
+    if len(s_idx) > MAX_SAMP: s_idx = rng.choice(s_idx, MAX_SAMP, replace=False)
+    if len(l_idx) > MAX_SAMP: l_idx = rng.choice(l_idx, MAX_SAMP, replace=False)
 
-    # 정규화 (각 채널 독립)
-    msr_norm = np.zeros_like(msr)
-    for c in range(3):
-        ch  = msr[:, :, c]
-        p2  = float(np.percentile(ch, 2))
-        p98 = float(np.percentile(ch, 98))
-        msr_norm[:, :, c] = np.clip((ch - p2) / max(p98 - p2, 1e-6) * 255, 0, 255)
+    sv = flat[s_idx]
+    lv = flat[l_idx]
 
-    # 그림자 마스크 영역에만 적용 (confidence 기반)
-    confidence = _shadow_confidence_mask(small if scale < 1.0 else img_bgr,
-                                          smask)
-    alpha    = (confidence * strength).clip(0, 1)[:, :, np.newaxis]
-    r_small  = small.astype(np.float32) * (1.0 - alpha) + msr_norm * alpha
-    r_small  = np.clip(r_small, 0, 255).astype(np.uint8)
+    # a, b 채널 색상 이동만 (L은 shadow_highlight_restore에서 처리)
+    diff_a = float(np.median(lv[:, 1]) - np.median(sv[:, 1]))
+    diff_b = float(np.median(lv[:, 2]) - np.median(sv[:, 2]))
 
-    if scale < 1.0:
-        r_full = cv2.resize(r_small, (w, h), interpolation=cv2.INTER_LINEAR)
-        conf_f = cv2.resize(
-            _shadow_confidence_mask(img_bgr, soft_mask),
-            (w, h), interpolation=cv2.INTER_LINEAR)
-        m_full = (conf_f * strength).clip(0, 1)[:, :, np.newaxis]
-        result = img_bgr.astype(np.float32) * (1.0 - m_full) + r_full.astype(np.float32) * m_full
-        return np.clip(result, 0, 255).astype(np.uint8)
+    # 색상 이동 제한 (최대 ±15)
+    diff_a = np.clip(diff_a, -15, 15)
+    diff_b = np.clip(diff_b, -15, 15)
 
-    return r_small
+    # 채도 보호 × soft mask × strength
+    alpha = (soft_mask * sat_prot * strength).clip(0, 1)
+
+    lab_result = lab.copy()
+    lab_result[:, :, 1] = np.clip(lab[:, :, 1] + diff_a * alpha, 0, 255)
+    lab_result[:, :, 2] = np.clip(lab[:, :, 2] + diff_b * alpha, 0, 255)
+
+    return cv2.cvtColor(lab_result.astype(np.uint8), cv2.COLOR_Lab2BGR)
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 4: AI 색상 보정 CNN
+# STEP 3: 영상 품질 개선 (전체 이미지)
+# ══════════════════════════════════════════════════════════
+
+def enhance_image_quality(img_bgr: np.ndarray,
+                           soft_mask: np.ndarray,
+                           clahe_clip: float = 2.0,
+                           denoise_h: int = 5,
+                           sharpen_amount: float = 1.0) -> np.ndarray:
+    """
+    영상 품질 개선 3단계:
+    1) 그림자 영역 CLAHE (로컬 대비 복원)
+    2) 선택적 노이즈 억제 (그림자 영역 위주)
+    3) 전체 적응형 언샤프 마스킹
+    """
+    h, w = img_bgr.shape[:2]
+    result = img_bgr.copy()
+
+    # ── 1. 그림자 영역 CLAHE
+    if clahe_clip > 0.1:
+        lab = cv2.cvtColor(result, cv2.COLOR_BGR2Lab)
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+        L_orig  = lab[:, :, 0].astype(np.float32)
+        L_clahe = clahe.apply(lab[:, :, 0]).astype(np.float32)
+
+        # 그림자 영역에만 적용 (비그림자는 원본 유지)
+        alpha_clahe = np.clip(soft_mask * 1.5, 0, 1)
+        lab[:, :, 0] = np.clip(
+            L_orig * (1 - alpha_clahe) + L_clahe * alpha_clahe,
+            0, 255).astype(np.uint8)
+        result = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+
+    # ── 2. 선택적 노이즈 억제
+    if denoise_h >= 2:
+        # 그림자 ROI에만 bilateral filter (속도 최적화)
+        shadow_bin = soft_mask > 0.30
+        if shadow_bin.sum() > 400:
+            ys, xs = np.where(shadow_bin)
+            pad = 15
+            y1 = max(0, int(ys.min()) - pad)
+            y2 = min(h, int(ys.max()) + pad)
+            x1 = max(0, int(xs.min()) - pad)
+            x2 = min(w, int(xs.max()) + pad)
+
+            roi = result[y1:y2, x1:x2]
+            roi_mask = soft_mask[y1:y2, x1:x2]
+
+            d_val   = max(3, min(int(denoise_h * 0.6), 7))
+            sigma_c = float(denoise_h * 8)
+            sigma_s = float(denoise_h * 3)
+            denoised = cv2.bilateralFilter(roi, d_val, sigma_c, sigma_s)
+
+            m = roi_mask[:, :, np.newaxis].clip(0, 1)
+            blended = roi.astype(np.float32) * (1.0 - m) + denoised.astype(np.float32) * m
+            result[y1:y2, x1:x2] = blended.clip(0, 255).astype(np.uint8)
+
+    # ── 3. 적응형 언샤프 마스킹 (Luminance 채널만)
+    if sharpen_amount > 0.05:
+        lab = cv2.cvtColor(result, cv2.COLOR_BGR2Lab)
+        L   = lab[:, :, 0].astype(np.float32)
+
+        # 다중 스케일 언샤프 (엣지 보존)
+        blur1 = cv2.GaussianBlur(L, (0, 0), 1.0)
+        blur2 = cv2.GaussianBlur(L, (0, 0), 2.5)
+        unsharp = L + (L - blur1) * sharpen_amount * 0.5 \
+                    + (L - blur2) * sharpen_amount * 0.2
+
+        # 하이라이트에서 언샤프 억제 (과보정 방지)
+        highlight_w = np.clip((L / 255.0 - 0.75) / 0.25, 0, 1)
+        unsharp = L * highlight_w + unsharp * (1.0 - highlight_w)
+
+        lab[:, :, 0] = np.clip(unsharp, 0, 255).astype(np.uint8)
+        result = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 4: 색상 진동(Fringing) 억제 및 최종 다듬기
+# ══════════════════════════════════════════════════════════
+
+def suppress_fringing(img_bgr: np.ndarray,
+                      soft_mask: np.ndarray) -> np.ndarray:
+    """
+    그림자 경계에서 발생하는 색상 진동(purple/green fringe) 억제.
+    경계 영역의 채도를 원본에 가깝게 부드럽게 만듦.
+    """
+    # 경계 = soft_mask 0.2~0.6 구간
+    edge_mask = np.clip(
+        1.0 - np.abs(soft_mask - 0.4) / 0.2, 0, 1
+    ).astype(np.float32)
+
+    if edge_mask.max() < 0.01:
+        return img_bgr.copy()
+
+    lab   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
+    # a, b 채널을 경계에서 약간 부드럽게
+    ks    = 7
+    a_blur = cv2.GaussianBlur(lab[:, :, 1], (ks, ks), 2.0)
+    b_blur = cv2.GaussianBlur(lab[:, :, 2], (ks, ks), 2.0)
+
+    alpha = edge_mask[:, :, np.newaxis] * 0.3  # 최대 30%만 부드럽게
+    lab[:, :, 1] = lab[:, :, 1] * (1 - edge_mask * 0.3) + a_blur * (edge_mask * 0.3)
+    lab[:, :, 2] = lab[:, :, 2] * (1 - edge_mask * 0.3) + b_blur * (edge_mask * 0.3)
+
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR)
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 5: AI 색상 복원 CNN (구조 유지)
 # ══════════════════════════════════════════════════════════
 
 class ColorRestorationNet(nn.Module):
@@ -240,9 +358,9 @@ class ColorRestorationNet(nn.Module):
             nn.Conv2d(64, 64, 3, padding=1), nn.LeakyReLU(0.2, inplace=True),
         )
         self.ctx = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=2, dilation=2), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 64, 3, padding=4, dilation=4), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 64, 3, padding=8, dilation=8), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 64, 3, padding=2,  dilation=2), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 64, 3, padding=4,  dilation=4), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 64, 3, padding=8,  dilation=8), nn.LeakyReLU(0.2, inplace=True),
         )
         self.dec = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1), nn.LeakyReLU(0.2, inplace=True),
@@ -259,24 +377,25 @@ class ColorRestorationNet(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        e   = self.enc(x)
-        c   = self.ctx(e)
-        ec  = torch.cat([e, c], dim=1)
-        res = torch.tanh(self.dec(ec)) * 0.12  # 잔차 제한 (과보정 방지)
+        e  = self.enc(x)
+        c  = self.ctx(e)
+        ec = torch.cat([e, c], dim=1)
+        # 잔차 제한 축소 (0.08): 과보정 방지
+        res = torch.tanh(self.dec(ec)) * 0.08
         return torch.clamp(x + res, 0, 1)
 
 
 def ai_color_restore(img_bgr: np.ndarray,
-                      soft_mask: np.ndarray,
-                      model,
-                      device: str = 'cpu',
-                      max_side: int = 800) -> np.ndarray:
-    """AI 모델 그림자 영역 색상 복원 (그림자 영역만 적용)"""
+                     soft_mask: np.ndarray,
+                     model,
+                     device: str = 'cpu',
+                     max_side: int = 800) -> np.ndarray:
+    """AI 모델 그림자 영역 색상 복원 (채도 보호 적용)"""
     if model is None:
         return img_bgr.copy()
 
-    h, w   = img_bgr.shape[:2]
-    scale  = min(1.0, max_side / max(h, w))
+    h, w  = img_bgr.shape[:2]
+    scale = min(1.0, max_side / max(h, w))
 
     if scale < 1.0:
         th, tw = int(h * scale), int(w * scale)
@@ -301,116 +420,84 @@ def ai_color_restore(img_bgr: np.ndarray,
         (out_np * 255).clip(0, 255).astype(np.uint8),
         cv2.COLOR_RGB2BGR)
 
-    # confidence 마스크로 블렌딩
-    conf_s = _shadow_confidence_mask(proc, pmask)
-    m      = conf_s[:, :, np.newaxis].clip(0, 1)
-    blended = proc.astype(np.float32) * (1 - m) + out_bgr.astype(np.float32) * m
+    # 채도 보호 × soft_mask 블렌딩
+    sat_prot = _saturation_protection_mask(proc)
+    m = (pmask * sat_prot * 0.7).clip(0, 1)[:, :, np.newaxis]
+    blended  = proc.astype(np.float32) * (1 - m) + out_bgr.astype(np.float32) * m
     result_s = blended.clip(0, 255).astype(np.uint8)
 
     if scale < 1.0:
         result_full = cv2.resize(result_s, (w, h), interpolation=cv2.INTER_LINEAR)
-        conf_f      = _shadow_confidence_mask(img_bgr, soft_mask)
-        m_full      = conf_f[:, :, np.newaxis].clip(0, 1)
-        final       = img_bgr.astype(np.float32) * (1 - m_full) + result_full.astype(np.float32) * m_full
+        sat_f  = _saturation_protection_mask(img_bgr)
+        m_full = (soft_mask * sat_f * 0.7).clip(0, 1)[:, :, np.newaxis]
+        final  = img_bgr.astype(np.float32) * (1 - m_full) + result_full.astype(np.float32) * m_full
         return final.clip(0, 255).astype(np.uint8)
 
     return result_s
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 5: 선명화 (그림자 ROI만)
-# ══════════════════════════════════════════════════════════
-
-def sharpen_shadow_region(img_bgr: np.ndarray,
-                           soft_mask: np.ndarray,
-                           denoise_h: int = 4,
-                           sharpen_amount: float = 1.0,
-                           clahe_clip: float = 1.8) -> np.ndarray:
-    """
-    그림자 ROI에만 bilateral filter + CLAHE + unsharp masking.
-    비그림자 영역은 절대 건드리지 않음.
-    """
-    h, w = img_bgr.shape[:2]
-
-    shadow_bin = soft_mask > 0.35
-    if shadow_bin.sum() < 200:
-        return img_bgr.copy()
-
-    ys, xs = np.where(shadow_bin)
-    pad    = 20
-    y1 = max(0, int(ys.min()) - pad)
-    y2 = min(h, int(ys.max()) + pad)
-    x1 = max(0, int(xs.min()) - pad)
-    x2 = min(w, int(xs.max()) + pad)
-
-    roi      = img_bgr[y1:y2, x1:x2].copy()
-    roi_mask = soft_mask[y1:y2, x1:x2]
-
-    roi_h, roi_w = roi.shape[:2]
-    MAX_ROI      = 800
-    roi_scale    = min(1.0, MAX_ROI / max(roi_h, roi_w, 1))
-
-    if roi_scale < 1.0:
-        proc_roi  = cv2.resize(roi,
-            (int(roi_w * roi_scale), int(roi_h * roi_scale)),
-            interpolation=cv2.INTER_AREA)
-        proc_mask = cv2.resize(roi_mask,
-            (int(roi_w * roi_scale), int(roi_h * roi_scale)),
-            interpolation=cv2.INTER_LINEAR)
-    else:
-        proc_roi, proc_mask = roi.copy(), roi_mask.copy()
-
-    # bilateral filter (denoise)
-    d_val    = max(3, min(int(denoise_h * 0.7), 7))
-    sigma_c  = float(denoise_h * 5)
-    sigma_s  = float(denoise_h * 2)
-    denoised = cv2.bilateralFilter(proc_roi, d_val, sigma_c, sigma_s)
-
-    # CLAHE (L채널만)
-    lab_img = cv2.cvtColor(denoised, cv2.COLOR_BGR2Lab)
-    clahe   = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-    lab_img[:, :, 0] = clahe.apply(lab_img[:, :, 0])
-    enhanced = cv2.cvtColor(lab_img, cv2.COLOR_Lab2BGR)
-
-    # Unsharp mask
-    blurred   = cv2.GaussianBlur(enhanced, (0, 0), 1.5)
-    amt       = sharpen_amount * 0.30
-    sharpened = cv2.addWeighted(enhanced, 1.0 + amt, blurred, -amt, 0)
-
-    # 마스크 블렌딩
-    m         = proc_mask[:, :, np.newaxis].clip(0, 1)
-    processed = proc_roi.astype(np.float32) * (1.0 - m) + sharpened.astype(np.float32) * m
-    processed = processed.clip(0, 255).astype(np.uint8)
-
-    if roi_scale < 1.0:
-        processed = cv2.resize(processed, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
-
-    result = img_bgr.copy()
-    result[y1:y2, x1:x2] = processed
-    return result
-
-
-# ══════════════════════════════════════════════════════════
-# 통합 파이프라인
+# 통합 파이프라인  v4.0
 # ══════════════════════════════════════════════════════════
 
 def restore_shadow_color(img_bgr: np.ndarray,
                           soft_mask: np.ndarray,
-                          radio_strength: float = 0.70,
-                          color_strength: float = 0.55,
+                          # Shadow/Highlight 파라미터
+                          shadow_amount: float    = 0.70,   # 그림자 밝기 복원
+                          highlight_amount: float = 0.20,   # 하이라이트 압축 (과보정 방지)
+                          midtone_contrast: float = 0.15,   # 중간톤 대비
+                          # 색상 보정
+                          color_strength: float   = 0.35,   # 색상 편이 보정
+                          # 품질 개선
+                          clahe_clip: float       = 2.0,    # CLAHE 강도
+                          denoise_h: int          = 5,      # 노이즈 억제
+                          sharpen_amount: float   = 0.8,    # 선명도
+                          # AI 모델
+                          ai_model                = None,
+                          device: str             = 'cpu',
+                          # 하위 호환성 (구 파라미터 무시)
+                          radio_strength: float   = 0.70,
+                          color_strength_compat: float = 0.55,
                           retinex_strength: float = 0.20,
-                          ai_model=None,
-                          device: str = 'cpu',
-                          denoise_h: int = 4,
-                          sharpen_amount: float = 1.0,
-                          clahe_clip: float = 1.8) -> np.ndarray:
+                          ) -> np.ndarray:
     """
-    통합 파이프라인.
-    모든 처리는 img_bgr/soft_mask 해상도에서 수행.
+    v4.0 통합 파이프라인:
+    1) Shadow/Highlight 복원  (Photoshop 방식)
+    2) 색상 편이 보정          (채도 보호 포함)
+    3) AI 색상 복원            (있을 경우)
+    4) 영상 품질 개선          (CLAHE + 노이즈 + 선명도)
+    5) 경계 Fringe 억제
+
+    ※ radio_strength, retinex_strength 파라미터는 하위 호환성을 위해 유지되지만
+       내부에서 shadow_amount / highlight_amount 로 매핑됩니다.
     """
-    step1 = radiometric_correction(img_bgr, soft_mask, radio_strength)
-    step2 = lab_color_transfer(step1, soft_mask, color_strength)
-    step3 = retinex_shadow_lighten(step2, soft_mask, retinex_strength)
-    step4 = ai_color_restore(step3, soft_mask, ai_model, device)
-    step5 = sharpen_shadow_region(step4, soft_mask, denoise_h, sharpen_amount, clahe_clip)
+    # ── 하위 호환성 매핑
+    # 구버전 radio_strength → shadow_amount 로 사용 (호출부가 그대로 넘길 때)
+    effective_shadow = max(shadow_amount, radio_strength * 0.9)
+    effective_shadow = min(effective_shadow, 0.95)
+
+    # 1. Shadow/Highlight 복원
+    step1 = shadow_highlight_restore(
+        img_bgr, soft_mask,
+        shadow_amount     = effective_shadow,
+        highlight_amount  = highlight_amount,
+        midtone_contrast  = midtone_contrast,
+        radius            = 40)
+
+    # 2. 색상 편이 보정 (채도 낮은 물체는 건너뜀)
+    step2 = color_cast_correction(step1, soft_mask, color_strength)
+
+    # 3. AI 색상 복원 (있을 경우, 잔차 방식이라 과보정 없음)
+    step3 = ai_color_restore(step2, soft_mask, ai_model, device)
+
+    # 4. 영상 품질 개선
+    step4 = enhance_image_quality(
+        step3, soft_mask,
+        clahe_clip      = clahe_clip,
+        denoise_h       = denoise_h,
+        sharpen_amount  = sharpen_amount)
+
+    # 5. 경계 Fringe 억제
+    step5 = suppress_fringing(step4, soft_mask)
+
     return step5

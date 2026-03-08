@@ -114,15 +114,19 @@ def process_single(
     detection_mode: str   = 'hybrid',
     sensitivity: float    = 0.45,
     feather: int          = 20,
-    # 복원
-    radio_strength: float    = 0.70,
-    color_strength: float    = 0.55,
-    retinex_strength: float  = 0.20,
+    # Shadow/Highlight 복원 (v4.0)
+    shadow_amount: float     = 0.70,    # 그림자 밝기 복원 강도
+    highlight_amount: float  = 0.20,    # 하이라이트 압축 (과보정 방지)
+    midtone_contrast: float  = 0.15,    # 중간톤 대비
+    color_strength: float    = 0.35,    # 색상 편이 보정
     use_ai_color: bool       = True,
-    # 선명화
-    denoise_h: int           = 4,
-    sharpen_amount: float    = 1.0,
-    clahe_clip: float        = 1.8,
+    # 품질 개선
+    denoise_h: int           = 5,
+    sharpen_amount: float    = 0.8,
+    clahe_clip: float        = 2.0,
+    # 하위 호환성
+    radio_strength: float    = 0.70,
+    retinex_strength: float  = 0.20,
     # 처리 모드
     preview_mode: bool       = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
@@ -163,14 +167,17 @@ def process_single(
     try:
         result = restore_shadow_color(
             work_img, soft,
-            radio_strength=radio_strength,
-            color_strength=color_strength,
-            retinex_strength=retinex_strength,
-            ai_model=ai_model,
-            device=_device,
-            denoise_h=denoise_h,
-            sharpen_amount=sharpen_amount,
-            clahe_clip=clahe_clip,
+            shadow_amount     = shadow_amount,
+            highlight_amount  = highlight_amount,
+            midtone_contrast  = midtone_contrast,
+            color_strength    = color_strength,
+            ai_model          = ai_model,
+            device            = _device,
+            denoise_h         = denoise_h,
+            sharpen_amount    = sharpen_amount,
+            clahe_clip        = clahe_clip,
+            radio_strength    = radio_strength,
+            retinex_strength  = retinex_strength,
         )
     except Exception as e:
         print(f"Color restoration error: {e}")

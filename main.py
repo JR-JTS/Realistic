@@ -785,15 +785,16 @@ class DroneApp(tk.Tk):
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
 
-        self.sl_radio   = self._slider(p, "조명 보정 강도",  0.0, 1.0, 0.70)
-        self.sl_color   = self._slider(p, "색 전달 강도",    0.0, 1.0, 0.55)
-        self.sl_retinex = self._slider(p, "Retinex 강도",   0.0, 0.5, 0.20)
+        self.sl_radio   = self._slider(p, "Shadow 복원 강도",   0.0, 1.0, 0.70)
+        self.sl_highlight = self._slider(p, "Highlight 압축",    0.0, 0.6, 0.20)
+        self.sl_midtone = self._slider(p,   "Midtone 대비",       0.0, 0.5, 0.15)
+        self.sl_color   = self._slider(p, "색상 편이 보정",    0.0, 0.8, 0.35)
 
-        # ── 선명화 설정
-        self._section(p, "선명화")
-        self.sl_denoise = self._slider(p, "노이즈 제거",     1,   12,  4,   fmt=".0f")
-        self.sl_sharpen = self._slider(p, "선명도",          0.3, 2.5, 1.0)
-        self.sl_clahe   = self._slider(p, "CLAHE 대비",      1.0, 4.0, 1.8)
+        # ── 영상 품질 개선
+        self._section(p, "영상 품질 개선")
+        self.sl_denoise = self._slider(p, "노이즈 제거",     1,   12,  5,   fmt=".0f")
+        self.sl_sharpen = self._slider(p, "선명도",          0.0, 2.0, 0.8)
+        self.sl_clahe   = self._slider(p, "CLAHE 로컈대비",  0.5, 4.0, 2.0)
 
         # ── 실행 버튼
         self._section(p, "")
@@ -1420,13 +1421,16 @@ class DroneApp(tk.Tk):
             "detection_mode":   self.detect_mode.get(),
             "sensitivity":      float(self.sl_sensitivity.get()),
             "feather":          int(self.sl_feather.get()),
-            "radio_strength":   float(self.sl_radio.get()),
+            "shadow_amount":    float(self.sl_radio.get()),
+            "highlight_amount": float(self.sl_highlight.get()),
+            "midtone_contrast": float(self.sl_midtone.get()),
             "color_strength":   float(self.sl_color.get()),
-            "retinex_strength": float(self.sl_retinex.get()),
             "use_ai_color":     bool(self.use_ai_color.get()),
             "denoise_h":        int(self.sl_denoise.get()),
             "sharpen_amount":   float(self.sl_sharpen.get()),
             "clahe_clip":       float(self.sl_clahe.get()),
+            "radio_strength":   float(self.sl_radio.get()),
+            "retinex_strength": 0.0,
         }
 
     # ── 배치 처리 스레드
