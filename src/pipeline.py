@@ -1,5 +1,5 @@
 """
-Processing Pipeline  –  드론 사진 그림자 제거 + 색상 복원  v3.0
+Processing Pipeline  – 드론 사진 그림자 제거 + 색상 복원  v1.71
 
 처리 경로:
   preview_mode=True  → 최대 800px 썸네일로 처리 (즉각 미리보기용, < 500ms 목표)
@@ -23,6 +23,7 @@ from shadow_detection import (
 from color_restoration import (
     ColorRestorationNet,
     restore_shadow_color,
+    analyze_image,
 )
 
 
@@ -114,16 +115,18 @@ def process_single(
     detection_mode: str   = 'hybrid',
     sensitivity: float    = 0.45,
     feather: int          = 20,
-    # v7.0 Shadow / Highlight 분리 파라미터
-    shadow_strength: float        = 0.85,  # 그림자 밝기+색상 복원 강도
-    highlight_strength: float     = 0.40,  # 밝은 영역 텍스처 복원 강도
+    # v1.71 Shadow / Highlight 파라미터 (0~100%)
+    shadow_pct: float             = 85.0,  # Shadow 복원 강도 (0=원본, 100=완전복원)
+    highlight_pct: float          = 30.0,  # Highlight 복원 강도 (0=원본, 100=최대)
     use_hue_consistent: bool      = True,  # Hue 기반 정밀 색상 복원
     use_ai_color: bool            = True,
     # 품질 개선
     denoise_h: int                = 4,
     sharpen_amount: float         = 0.7,
     clahe_clip: float             = 2.0,
-    # 하위 호환성 (GUI 구버전 슬라이더 대응)
+    # 하위 호환성 (구버전 0~1.0 파라미터 자동 변환)
+    shadow_strength: float        = -1.0,  # -1 = 미사용 (shadow_pct 우선)
+    highlight_strength: float     = -1.0,  # -1 = 미사용
     color_restore_strength: float = 0.85,
     highlight_protect: float      = 0.25,
     shadow_amount: float          = 0.70,
@@ -140,7 +143,7 @@ def process_single(
     preview_mode: bool            = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
-    단일 이미지 처리 v7.0.
+    단일 이미지 처리 v1.71.
     Returns: (result_bgr, binary_mask, soft_mask, stats_dict)
 
     preview_mode=True  : PREVIEW_MAX_PX 이하로 처리 후 원본 크기로 upscale 반환
@@ -179,21 +182,34 @@ def process_single(
     stats['detect_ms']    = stats['detection_ms']
     stats['shadow_pct']   = round(float((binary > 0).sum()) / max(wh * ww, 1) * 100, 1)
 
-    # ── 2. 색상 복원 (v7.0: Shadow/Highlight 완전 분리)
+    # ── 2. 색상 복원 (v1.71: 적응형 분석 + Shadow/Highlight % 제어)
     t0 = time.perf_counter()
     ai_model = _color_model if use_ai_color else None
 
-    # 하위 호환성: 구버전 파라미터 병합
-    eff_shadow    = max(shadow_strength, color_restore_strength, shadow_amount * 0.9)
-    eff_highlight = max(highlight_strength, highlight_protect * 1.5)
+    # 하위 호환성: 구버전 0~1.0 파라미터를 % 변환
+    if shadow_strength >= 0:
+        # 구버전 파라미터가 명시적으로 전달된 경우
+        eff_shadow_pct = max(shadow_pct,
+                              shadow_strength * 100.0,
+                              color_restore_strength * 100.0,
+                              shadow_amount * 90.0)
+    else:
+        eff_shadow_pct = shadow_pct
+
+    if highlight_strength >= 0:
+        eff_highlight_pct = max(highlight_pct,
+                                 highlight_strength * 100.0,
+                                 highlight_protect * 150.0)
+    else:
+        eff_highlight_pct = highlight_pct
 
     try:
         from color_restoration import process_roi as _process_roi
         result = _process_roi(
             work_img, soft,
             roi_rect           = work_roi,
-            shadow_strength    = min(eff_shadow, 1.0),
-            highlight_strength = eff_highlight,
+            shadow_strength    = eff_shadow_pct,    # 퍼센트 (0~100)
+            highlight_strength = eff_highlight_pct, # 퍼센트 (0~100)
             use_hue_consistent = use_hue_consistent,
             ai_model           = ai_model,
             device             = _device,

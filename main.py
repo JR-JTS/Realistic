@@ -1,17 +1,14 @@
 """
 Drone Shadow Remover & Color Restorer
-Desktop Application  –  Tkinter GUI  v3.0
+Desktop Application  –  Tkinter GUI  v1.71
 ────────────────────────────────────────
 실행: python main.py
 
-v3.0 수정 사항:
-  • ZoomCanvas: 드래그·줌 이벤트 충돌 완전 수정, 왼쪽 패널 휠 간섭 제거
-  • 비교 탭: 레이아웃 완전 수정 (행/열 weight 정확하게 재설정)
-  • 미리보기 플래그: finally 블록으로 항상 해제 보장
-  • 파일 선택 → 원본 표시 → 더블클릭 → 비교 탭으로 자동 전환
-  • 재처리: 슬라이더 조정 후 버튼 클릭 시 즉시 재처리 가능
-  • 그림자 탐지 과보정 방지 (청색편이 기반 신뢰도 가중치)
-  • 처리 오류 상세 로그
+v1.71 수정 사항:
+  • Shadow / Highlight 슬라이더: 0~100 퍼센트 단위 (0=원본, 100=최대 복원)
+  • 이미지별 통계 자동 분석 — 하드코딩 없이 적응형 gain 계산
+  • 사진마다 다른 그림자 특성에 맞게 자동 보정
+  • 버전 표기 v1.71로 통일
 """
 
 import tkinter as tk
@@ -644,7 +641,7 @@ class DroneApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Drone Shadow Remover & Color Restorer  v3.0")
+        self.title("Drone Shadow Remover & Color Restorer  v1.71")
         self.geometry("1560x960")
         self.minsize(1200, 720)
         self.configure(bg=DARK)
@@ -720,10 +717,10 @@ class DroneApp(tk.Tk):
 
         left = tk.Frame(hdr, bg=DARK3)
         left.pack(side="left", padx=16)
-        tk.Label(left, text="Drone Shadow Remover", bg=DARK3, fg=WHITE,
+        tk.Label(left, text="Drone Shadow Remover  v1.71", bg=DARK3, fg=WHITE,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         tk.Label(left,
-                  text="v3.0  |  클릭:원본  |  더블클릭:즉시처리  |  슬라이더 조정 후 미리보기 버튼으로 재처리",
+                  text="v1.71  |  클릭:원본  |  더블클릭:즉시처리  |  슬라이더 조정 후 미리보기 버튼으로 재처리",
                   bg=DARK3, fg=TEXT2, font=("Segoe UI", 9)).pack(anchor="w")
 
         FlatButton(hdr, "AI 모델 다운로드", command=self._open_model_download,
@@ -798,7 +795,7 @@ class DroneApp(tk.Tk):
         self.sl_sensitivity = self._slider(p, "탐지 민감도",   0.1, 1.0, 0.45)
         self.sl_feather     = self._slider(p, "마스크 페더링", 3,   50,  20, fmt=".0f")
 
-        # ── 색상 복원 설정 (v7.0 Shadow / Highlight 분리)
+        # ── 색상 복원 설정 (v1.71 Shadow / Highlight 분리 + 적응형 분석)
         self._section(p, "Shadow  (그림자 밝게 + 색상 복원)")
         self.use_ai_color = tk.BooleanVar(value=True)
         tk.Checkbutton(p, text="AI 미세 보정 (모델 로드 시 활성)",
@@ -813,11 +810,15 @@ class DroneApp(tk.Tk):
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
 
-        self.sl_shadow   = self._slider(p, "Shadow 복원 강도",  0.0, 1.0, 0.85)
+        # Shadow: 0=원본, 100=완전복원 (%)
+        self.sl_shadow   = self._slider(p, "Shadow  0=원본 / 100=완전복원 (%)",
+                                         0, 100, 85, fmt=".0f")
         self._bind_slider_live(self.sl_shadow)
 
         self._section(p, "Highlight  (밝은 영역 텍스처 복원)")
-        self.sl_highlight = self._slider(p, "Highlight 복원 강도", 0.0, 1.0, 0.40)
+        # Highlight: 0=원본, 100=최대 복원 (%)
+        self.sl_highlight = self._slider(p, "Highlight  0=원본 / 100=최대 (%)",
+                                          0, 100, 30, fmt=".0f")
         self._bind_slider_live(self.sl_highlight)
 
         # ── 영상 품질 개선
@@ -1325,7 +1326,7 @@ class DroneApp(tk.Tk):
         self.status_lbl = tk.Label(ft, text="준비", bg=DARK3, fg=TEXT2,
                                     font=("Segoe UI", 9), padx=10)
         self.status_lbl.pack(side="left", pady=3)
-        tk.Label(ft, text="v3.0  |  더블클릭: 즉시 처리  |  슬라이더 조정 → 미리보기 버튼으로 재처리",
+        tk.Label(ft, text="v1.71  |  더블클릭: 즉시 처리  |  슬라이더 조정 → 미리보기 버튼으로 재처리",
                   bg=DARK3, fg=TEXT2, font=("Segoe UI", 8), padx=10
                   ).pack(side="right", pady=3)
         # 창 크기 변경 → compare 탭 재배치
@@ -1522,25 +1523,29 @@ class DroneApp(tk.Tk):
         self._set_status("중단 요청 중...", WARN)
 
     def _collect_params(self):
+        shadow_pct    = float(self.sl_shadow.get())     # 0~100 (%)
+        highlight_pct = float(self.sl_highlight.get())  # 0~100 (%)
         return {
-            "detection_mode":         self.detect_mode.get(),
-            "sensitivity":            float(self.sl_sensitivity.get()),
-            "feather":                int(self.sl_feather.get()),
-            # v7.0 Shadow / Highlight 분리 파라미터
-            "shadow_strength":        float(self.sl_shadow.get()),
-            "highlight_strength":     float(self.sl_highlight.get()),
-            "use_hue_consistent":     bool(self.use_hue_consist.get()),
-            "use_ai_color":           bool(self.use_ai_color.get()),
+            "detection_mode":     self.detect_mode.get(),
+            "sensitivity":        float(self.sl_sensitivity.get()),
+            "feather":            int(self.sl_feather.get()),
+            # v1.71 Shadow / Highlight % 파라미터
+            "shadow_pct":         shadow_pct,
+            "highlight_pct":      highlight_pct,
+            "use_hue_consistent": bool(self.use_hue_consist.get()),
+            "use_ai_color":       bool(self.use_ai_color.get()),
             # 품질 개선
-            "denoise_h":              int(self.sl_denoise.get()),
-            "sharpen_amount":         float(self.sl_sharpen.get()),
-            "clahe_clip":             float(self.sl_clahe.get()),
-            # 하위 호환성
-            "color_restore_strength": float(self.sl_shadow.get()),
-            "highlight_protect":      float(self.sl_highlight.get()) * 0.4,
-            "shadow_amount":          float(self.sl_shadow.get()),
-            "highlight_amount":       float(self.sl_highlight.get()),
-            "radio_strength":         float(self.sl_shadow.get()),
+            "denoise_h":          int(self.sl_denoise.get()),
+            "sharpen_amount":     float(self.sl_sharpen.get()),
+            "clahe_clip":         float(self.sl_clahe.get()),
+            # 하위 호환성 (구버전 대응 — shadow_strength=-1 → shadow_pct 우선)
+            "shadow_strength":        -1.0,
+            "highlight_strength":     -1.0,
+            "color_restore_strength": shadow_pct / 100.0,
+            "highlight_protect":      highlight_pct / 100.0 * 0.4,
+            "shadow_amount":          shadow_pct / 100.0,
+            "highlight_amount":       highlight_pct / 100.0,
+            "radio_strength":         shadow_pct / 100.0,
             "retinex_strength":       0.0,
             "shadow_lift":            0.15,
             "blur_radius":            60,
