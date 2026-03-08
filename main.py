@@ -1,10 +1,11 @@
 """
 Drone Shadow Remover & Color Restorer
-Desktop Application  –  Tkinter GUI  v2.0
+Desktop Application  –  Tkinter GUI  v2.1
 ────────────────────────────────────────
 실행: python main.py
 
-새 기능 (v2.0):
+새 기능 (v2.1):
+  • AI 모델 다운로드 창 (헤더 버튼)
   • 단일 이미지 사전 처리 & 미리보기 (파일 선택 → "이 이미지 처리" 버튼)
   • 원본/복원 이미지 줌(마우스 휠), 패닝(드래그)
   • 마음에 들면 "전체 배치 처리 시작" 버튼으로 일괄 처리
@@ -18,6 +19,8 @@ import queue
 import os
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,6 +34,33 @@ from pipeline import (
     load_models, process_single, scan_folder,
     scan_folder_recursive, make_compare, SUPPORTED_EXT
 )
+
+# ──────────────────────────────────────────────────────────
+# AI 모델 다운로드 정보
+# ──────────────────────────────────────────────────────────
+# 다운로드 서버 베이스 URL (배포 시 실제 URL로 교체 가능)
+MODEL_SERVER_BASE = "https://8080-i65w3eivwijb8fftrewca-2b54fc91.sandbox.novita.ai"
+
+MODEL_INFO = [
+    {
+        "name":    "shadow_detector.pth",
+        "label":   "그림자 탐지 AI  (ShadowDetectorNet)",
+        "desc":    "UNet 스타일 경량 CNN – 드론 항공사진 그림자 영역 탐지\n"
+                   "크기: ~7.5 MB  |  아키텍처: UNet (1.9M 파라미터)",
+        "url":     MODEL_SERVER_BASE + "/models/shadow_detector.pth",
+        "size_mb": 7.5,
+        "dest":    "shadow_detector.pth",
+    },
+    {
+        "name":    "color_restore.pth",
+        "label":   "색상 복원 AI  (ColorRestorationNet)",
+        "desc":    "Dilated-Conv 잔차학습 CNN – 그림자 영역 색상/밝기 복원\n"
+                   "크기: ~0.9 MB  |  아키텍처: Residual (241K 파라미터)",
+        "url":     MODEL_SERVER_BASE + "/models/color_restore.pth",
+        "size_mb": 0.9,
+        "dest":    "color_restore.pth",
+    },
+]
 
 # ──────────────────────────────────────────────────────────
 # 색상 테마
@@ -145,6 +175,359 @@ class LabeledSlider(tk.Frame):
         self.val_lbl.config(text=format(float(v), self._fmt))
 
     def get(self): return self.var.get()
+
+
+# ──────────────────────────────────────────────────────────
+# AI 모델 다운로드 다이얼로그
+# ──────────────────────────────────────────────────────────
+
+class ModelDownloadDialog(tk.Toplevel):
+    """
+    AI 모델(.pth) 다운로드 전용 창.
+    • 각 모델별 상태(미설치/설치됨/다운로드 중) 표시
+    • 개별 / 전체 다운로드 버튼
+    • 실시간 진행바 + 속도/크기 표시
+    • 다운로드 완료 후 '앱 재시작 없이 모델 즉시 적용' 옵션
+    """
+
+    def __init__(self, parent, model_dir: str, reload_callback=None):
+        super().__init__(parent)
+        self.title("🤖  AI 모델 다운로드")
+        self.geometry("680x520")
+        self.minsize(600, 440)
+        self.configure(bg=DARK)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self._model_dir      = model_dir
+        self._reload_cb      = reload_callback   # 다운로드 후 모델 재로드 콜백
+        self._dl_threads     = {}                # name → thread
+        self._cancel_flags   = {}                # name → threading.Event
+        self._queue          = queue.Queue()
+
+        self._build_ui()
+        self._refresh_status()
+        self._poll()
+
+    # ── UI 구성 ──────────────────────────────────────────
+
+    def _build_ui(self):
+        # 헤더
+        hdr = tk.Frame(self, bg=DARK3, height=52)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="🤖  AI 모델 다운로드 관리",
+                  bg=DARK3, fg=WHITE,
+                  font=("Segoe UI", 13, "bold")).pack(side="left", padx=16, pady=10)
+        tk.Label(hdr,
+                  text="모델을 설치하면 그림자 탐지와 색상 복원 정확도가 향상됩니다",
+                  bg=DARK3, fg=TEXT2,
+                  font=("Segoe UI", 9)).pack(side="left", padx=4)
+
+        # 서버 URL 입력
+        url_f = tk.Frame(self, bg=DARK2, pady=6)
+        url_f.pack(fill="x", padx=12, pady=(8,0))
+        tk.Label(url_f, text="다운로드 서버 URL:",
+                  bg=DARK2, fg=TEXT2, font=("Segoe UI",9)).pack(side="left", padx=8)
+        self._url_var = tk.StringVar(value=MODEL_SERVER_BASE)
+        url_entry = tk.Entry(url_f, textvariable=self._url_var,
+                              bg="#1a1a30", fg=ACC2, insertbackground=WHITE,
+                              relief="flat", font=("Consolas",9), width=50)
+        url_entry.pack(side="left", fill="x", expand=True, ipady=3, padx=4)
+        FlatButton(url_f, "적용",
+                    command=self._apply_url,
+                    bg=DARK3, hover=DARK2, fg=TEXT2,
+                    width=60, height=28, font_size=9
+        ).pack(side="left", padx=6)
+
+        # 안내 텍스트
+        info_f = tk.Frame(self, bg=DARK, pady=4)
+        info_f.pack(fill="x", padx=12)
+        tk.Label(info_f,
+                  text="💡 기본 URL은 현재 샌드박스 서버입니다. "
+                       "파일을 직접 복사한 경우 [models] 폴더에 넣으면 자동 인식됩니다.",
+                  bg=DARK, fg=TEXT2, font=("Segoe UI",8),
+                  wraplength=640, justify="left").pack(anchor="w")
+
+        # 모델 카드 목록
+        self._cards = {}
+        for info in MODEL_INFO:
+            card = self._make_model_card(info)
+            self._cards[info["name"]] = card
+
+        # 하단 버튼
+        btn_f = tk.Frame(self, bg=DARK, pady=8)
+        btn_f.pack(fill="x", padx=12)
+
+        FlatButton(btn_f, "⬇  전체 다운로드",
+                    command=self._download_all,
+                    bg=ACCENT, hover="#5b4dd6",
+                    width=160, height=36, font_size=10
+        ).pack(side="left", padx=(0,8))
+
+        FlatButton(btn_f, "🔄  상태 새로고침",
+                    command=self._refresh_status,
+                    bg=DARK3, hover=DARK2, fg=TEXT2,
+                    width=140, height=36, font_size=10
+        ).pack(side="left", padx=(0,8))
+
+        FlatButton(btn_f, "✅  적용 후 닫기",
+                    command=self._apply_and_close,
+                    bg="#1a6b3a", hover="#0f4a28",
+                    width=140, height=36, font_size=10
+        ).pack(side="left")
+
+        # 전체 진행 로그
+        log_f = tk.Frame(self, bg=CARD)
+        log_f.pack(fill="both", expand=True, padx=12, pady=(4,8))
+        tk.Label(log_f, text="📋 다운로드 로그",
+                  bg=CARD, fg=TEXT2, font=("Segoe UI",9,"bold"),
+                  padx=8).pack(anchor="w", pady=(4,2))
+        log_sb = ttk.Scrollbar(log_f, orient="vertical")
+        self._log_text = tk.Text(
+            log_f, bg=CARD, fg=TEXT, font=("Consolas",8),
+            relief="flat", wrap="word", state="disabled", height=6,
+            yscrollcommand=log_sb.set,
+        )
+        log_sb.config(command=self._log_text.yview)
+        log_sb.pack(side="right", fill="y")
+        self._log_text.pack(fill="both", expand=True, padx=4, pady=(0,4))
+        self._log_text.tag_config("ok",    foreground=GREEN)
+        self._log_text.tag_config("warn",  foreground=WARN)
+        self._log_text.tag_config("error", foreground=RED)
+        self._log_text.tag_config("info",  foreground=TEXT2)
+
+    def _make_model_card(self, info: dict) -> dict:
+        """모델 1개짜리 카드 위젯 묶음 반환"""
+        name = info["name"]
+
+        card = tk.Frame(self, bg=CARD, padx=12, pady=10)
+        card.pack(fill="x", padx=12, pady=4)
+
+        # 왼쪽: 이름 + 설명
+        left = tk.Frame(card, bg=CARD)
+        left.pack(side="left", fill="both", expand=True)
+
+        title_f = tk.Frame(left, bg=CARD)
+        title_f.pack(fill="x")
+        name_lbl = tk.Label(title_f, text=info["label"],
+                             bg=CARD, fg=WHITE,
+                             font=("Segoe UI",10,"bold"))
+        name_lbl.pack(side="left")
+
+        # 상태 배지
+        status_lbl = tk.Label(title_f, text="…",
+                               bg=CARD, fg=TEXT2,
+                               font=("Segoe UI",8), padx=8)
+        status_lbl.pack(side="left", padx=8)
+
+        desc_lbl = tk.Label(left, text=info["desc"],
+                              bg=CARD, fg=TEXT2,
+                              font=("Segoe UI",8),
+                              justify="left", anchor="w")
+        desc_lbl.pack(fill="x", pady=(2,4))
+
+        # 진행바
+        prog = ttk.Progressbar(left, mode="determinate", length=400)
+        prog.pack(fill="x", pady=(2,0))
+        prog_lbl = tk.Label(left, text="",
+                             bg=CARD, fg=TEXT2, font=("Consolas",8))
+        prog_lbl.pack(anchor="e")
+
+        # 오른쪽: 버튼
+        right = tk.Frame(card, bg=CARD)
+        right.pack(side="right", padx=(12,0))
+
+        dl_btn = FlatButton(right, "⬇  다운로드",
+                             command=lambda n=name: self._download_one(n),
+                             bg="#2a6496", hover="#1d4f75",
+                             width=110, height=32, font_size=9)
+        dl_btn.pack(pady=(0,6))
+
+        cancel_btn = FlatButton(right, "⏹  중단",
+                                 command=lambda n=name: self._cancel_one(n),
+                                 bg="#6b2222", hover="#4a1515",
+                                 width=110, height=32, font_size=9)
+        cancel_btn.pack()
+        cancel_btn.set_enabled(False)
+
+        return {
+            "info":       info,
+            "status_lbl": status_lbl,
+            "prog":       prog,
+            "prog_lbl":   prog_lbl,
+            "dl_btn":     dl_btn,
+            "cancel_btn": cancel_btn,
+        }
+
+    # ── 상태 새로고침 ──────────────────────────────────
+
+    def _refresh_status(self):
+        for name, card in self._cards.items():
+            path = os.path.join(self._model_dir, name)
+            if os.path.exists(path):
+                sz = os.path.getsize(path) / 1024 / 1024
+                card["status_lbl"].config(
+                    text=f"✅ 설치됨  ({sz:.1f} MB)", fg=GREEN)
+                card["prog"]["value"] = 100
+                card["prog_lbl"].config(text="완료")
+            else:
+                card["status_lbl"].config(text="❌ 미설치", fg=RED)
+                card["prog"]["value"] = 0
+                card["prog_lbl"].config(text="")
+
+    def _apply_url(self):
+        """서버 URL 변경 시 MODEL_INFO URL 업데이트"""
+        base = self._url_var.get().rstrip("/")
+        for info in MODEL_INFO:
+            info["url"] = base + "/models/" + info["dest"]
+        self._log("URL 변경: " + base, "info")
+
+    # ── 다운로드 로직 ──────────────────────────────────
+
+    def _download_one(self, name: str):
+        if name in self._dl_threads and self._dl_threads[name].is_alive():
+            return  # 이미 진행 중
+
+        info  = next(i for i in MODEL_INFO if i["name"] == name)
+        card  = self._cards[name]
+        flag  = threading.Event()
+        self._cancel_flags[name] = flag
+
+        card["dl_btn"].set_enabled(False)
+        card["cancel_btn"].set_enabled(True)
+        card["status_lbl"].config(text="⬇ 다운로드 중…", fg=WARN)
+
+        def _work():
+            dest_path = os.path.join(self._model_dir, info["dest"])
+            os.makedirs(self._model_dir, exist_ok=True)
+            url = info["url"]
+            self._queue.put(("dl_log", name, f"⬇ 시작: {url}", "info"))
+
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "DroneShadowRemover/2.1"}
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    total = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    chunk = 65536   # 64 KB
+                    t_start = time.time()
+
+                    with open(dest_path, "wb") as f:
+                        while True:
+                            if flag.is_set():
+                                self._queue.put(("dl_cancel", name))
+                                return
+                            data = resp.read(chunk)
+                            if not data:
+                                break
+                            f.write(data)
+                            downloaded += len(data)
+
+                            elapsed = max(time.time() - t_start, 0.001)
+                            speed   = downloaded / elapsed / 1024  # KB/s
+                            pct     = int(downloaded / total * 100) if total else 0
+                            self._queue.put((
+                                "dl_progress", name,
+                                pct,
+                                f"{downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB  "
+                                f"({speed:.0f} KB/s)"
+                            ))
+
+                sz = os.path.getsize(dest_path) / 1024 / 1024
+                self._queue.put(("dl_done", name,
+                                  f"✅ 완료: {info['dest']}  ({sz:.1f} MB)"))
+            except Exception as e:
+                # 실패 시 불완전 파일 삭제
+                if os.path.exists(dest_path):
+                    try:
+                        os.remove(dest_path)
+                    except Exception:
+                        pass
+                self._queue.put(("dl_error", name, str(e)))
+
+        t = threading.Thread(target=_work, daemon=True)
+        self._dl_threads[name] = t
+        t.start()
+
+    def _download_all(self):
+        for info in MODEL_INFO:
+            path = os.path.join(self._model_dir, info["dest"])
+            if not os.path.exists(path):
+                self._download_one(info["name"])
+
+    def _cancel_one(self, name: str):
+        if name in self._cancel_flags:
+            self._cancel_flags[name].set()
+
+    def _apply_and_close(self):
+        """모델 재로드 후 창 닫기"""
+        if self._reload_cb:
+            self._reload_cb()
+        self.destroy()
+
+    # ── 큐 폴링 ──────────────────────────────────────
+
+    def _poll(self):
+        try:
+            while True:
+                msg  = self._queue.get_nowait()
+                kind = msg[0]
+
+                if kind == "dl_progress":
+                    _, name, pct, txt = msg
+                    card = self._cards[name]
+                    card["prog"]["value"] = pct
+                    card["prog_lbl"].config(text=txt)
+
+                elif kind == "dl_done":
+                    _, name, log_msg = msg
+                    card = self._cards[name]
+                    card["prog"]["value"]   = 100
+                    card["prog_lbl"].config(text="완료")
+                    card["status_lbl"].config(text="✅ 설치됨", fg=GREEN)
+                    card["dl_btn"].set_enabled(True)
+                    card["cancel_btn"].set_enabled(False)
+                    self._log(log_msg, "ok")
+
+                elif kind == "dl_cancel":
+                    _, name = msg
+                    card = self._cards[name]
+                    card["status_lbl"].config(text="⏹ 취소됨", fg=WARN)
+                    card["prog"]["value"] = 0
+                    card["prog_lbl"].config(text="")
+                    card["dl_btn"].set_enabled(True)
+                    card["cancel_btn"].set_enabled(False)
+                    self._log(f"⏹ 취소: {name}", "warn")
+
+                elif kind == "dl_error":
+                    _, name, err = msg
+                    card = self._cards[name]
+                    card["status_lbl"].config(text="❌ 오류", fg=RED)
+                    card["prog"]["value"] = 0
+                    card["prog_lbl"].config(text="")
+                    card["dl_btn"].set_enabled(True)
+                    card["cancel_btn"].set_enabled(False)
+                    self._log(f"❌ 오류 ({name}): {err}", "error")
+
+                elif kind == "dl_log":
+                    _, name, msg_txt, tag = msg
+                    self._log(msg_txt, tag)
+
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(100, self._poll)
+
+    def _log(self, text: str, tag: str = "info"):
+        self._log_text.config(state="normal")
+        ts = time.strftime("%H:%M:%S")
+        self._log_text.insert("end", f"[{ts}] {text}\n", tag)
+        self._log_text.see("end")
+        self._log_text.config(state="disabled")
 
 
 # ──────────────────────────────────────────────────────────
@@ -295,7 +678,7 @@ class DroneApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("🛸  Drone Shadow Remover & Color Restorer  v2.0")
+        self.title("🛸  Drone Shadow Remover & Color Restorer  v2.1")
         self.geometry("1480x900")
         self.minsize(1200, 720)
         self.configure(bg=DARK)
@@ -381,14 +764,21 @@ class DroneApp(tk.Tk):
         tk.Label(title_f, text="Drone Shadow Remover & Color Restorer",
                   bg=DARK3, fg=WHITE,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(title_f, text="v2.0  —  단일 미리보기 + 줌/패닝 + 배치 처리",
+        tk.Label(title_f, text="v2.1  —  AI 모델 다운로드 + 단일 미리보기 + 줌/패닝 + 배치 처리",
                   bg=DARK3, fg=TEXT2,
                   font=("Segoe UI", 9)).pack(anchor="w")
+
+        # 모델 다운로드 버튼
+        FlatButton(hdr, "🤖  AI 모델 다운로드",
+                    command=self._open_model_download,
+                    bg="#2a6496", hover="#1d4f75",
+                    width=160, height=34, font_size=9
+        ).pack(side="right", padx=8, pady=12)
 
         self.model_badge = tk.Label(hdr, text="⏳ 모델 로딩 중",
                                      bg=DARK3, fg=WARN,
                                      font=("Segoe UI", 9))
-        self.model_badge.pack(side="right", padx=20)
+        self.model_badge.pack(side="right", padx=8)
 
     # ── 왼쪽 패널 : 폴더 선택 + 설정 ─────────────────────
 
@@ -886,12 +1276,30 @@ class DroneApp(tk.Tk):
         self.status_lbl = tk.Label(ft, text="준비", bg=DARK3, fg=TEXT2,
                                     font=("Segoe UI",9), padx=12)
         self.status_lbl.pack(side="left", pady=4)
-        tk.Label(ft, text="Drone Shadow Remover v2.0  |  🔬 선택 미리보기 → ▶ 전체 처리",
+        tk.Label(ft, text="Drone Shadow Remover v2.1  |  🤖 AI 모델 다운로드  |  🔬 선택 미리보기 → ▶ 전체 처리",
                   bg=DARK3, fg=TEXT2, font=("Segoe UI",8), padx=12).pack(side="right", pady=4)
 
     # ──────────────────────────────────────────────────────
     # 이벤트 핸들러
     # ──────────────────────────────────────────────────────
+
+    # ── 모델 다운로드 창 열기 ────────────────────────────
+
+    def _open_model_download(self):
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+        dlg = ModelDownloadDialog(
+            self,
+            model_dir=model_dir,
+            reload_callback=self._reload_models,
+        )
+        dlg.focus()
+
+    def _reload_models(self):
+        """다운로드 후 모델을 메모리에 다시 로드"""
+        self._set_status("모델 재로드 중…", WARN)
+        self.model_badge.config(text="⏳ 재로딩…", fg=WARN)
+        self._load_models_async()
+        self._log("🔄 모델 재로드 요청됨 — 잠시 기다리세요", "warn")
 
     def _browse_input(self):
         init = self.input_folder.get().strip()
