@@ -417,7 +417,7 @@ class DroneApp(tk.Tk):
             b.pack(side="left")
             b.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
             self._tab_btns[key] = b
-        self._switch_tab("compare")
+        # ※ _switch_tab 은 preview_canvas 생성 후 호출 (아래에서)
 
         # 이미지 표시 영역
         img_wrap = tk.Frame(frame, bg=CARD)
@@ -429,6 +429,9 @@ class DroneApp(tk.Tk):
                                          highlightthickness=0)
         self.preview_canvas.grid(row=0, column=0, sticky="nsew")
         self.preview_canvas.bind("<Configure>", self._redraw_preview)
+
+        # preview_canvas 생성 완료 후 탭 초기화
+        self._switch_tab("compare")
 
         # 기본 안내 텍스트
         self.preview_canvas.create_text(
@@ -465,6 +468,9 @@ class DroneApp(tk.Tk):
         self._redraw_preview()
 
     def _redraw_preview(self, event=None):
+        # preview_canvas 가 아직 생성되지 않은 경우 무시
+        if not hasattr(self, 'preview_canvas'):
+            return
         w = self.preview_canvas.winfo_width()
         h = self.preview_canvas.winfo_height()
         if w < 10 or h < 10:
