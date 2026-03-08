@@ -58,54 +58,63 @@ def pil2tk(pil_img: Image.Image) -> ImageTk.PhotoImage:
 
 
 # ──────────────────────────────────────────────────────────
-# 커스텀 위젯: 둥근 버튼
+# 커스텀 위젯: 플랫 버튼 (tk.Label 기반 – Canvas 버그 없음)
 # ──────────────────────────────────────────────────────────
 
-class FlatButton(tk.Canvas):
+class FlatButton(tk.Label):
+    """
+    Canvas 없이 tk.Label로 구현한 플랫 버튼.
+    Windows/macOS/Linux 모든 환경에서 안정적으로 동작.
+    """
     def __init__(self, parent, text="", command=None,
                  bg=ACCENT, fg=WHITE, hover=DARK3,
                  width=160, height=36, radius=8,
                  font_size=11, **kw):
-        super().__init__(parent, width=width, height=height,
-                          bg=parent["bg"] if "bg" in kw else DARK,
-                          highlightthickness=0, **kw)
+        # width/height/radius는 내부 저장용 (Label은 px 단위 크기 직접 지정)
+        # kw에서 tk.Label이 모르는 인자 제거
+        kw.pop("radius", None)
+
+        # 픽셀 단위 크기 지정을 위해 font 기반으로 설정
+        super().__init__(
+            parent,
+            text=text,
+            bg=bg,
+            fg=fg,
+            font=("Segoe UI", font_size, "bold"),
+            cursor="hand2",
+            relief="flat",
+            padx=max(4, (width - len(text) * (font_size + 2)) // 2),
+            pady=max(2, (height - font_size - 6) // 2),
+            **kw
+        )
         self._bg      = bg
         self._hover   = hover
         self._fg      = fg
-        self._text    = text
-        self._cmd     = command
-        self._w       = width
-        self._h       = height
-        self._r       = radius
-        self._fsize   = font_size
         self._enabled = True
-        self._draw(bg)
-        self.bind("<Enter>",        self._on_enter)
-        self.bind("<Leave>",        self._on_leave)
-        self.bind("<ButtonPress-1>",self._on_press)
+        self._cmd     = command
 
-    def _round_rect(self, x1, y1, x2, y2, r, **kw):
-        pts = [x1+r,y1, x2-r,y1, x2,y1, x2,y1+r, x2,y2-r,
-               x2,y2, x2-r,y2, x1+r,y2, x1,y2, x1,y2-r, x1,y1+r, x1,y1]
-        return self.create_polygon(pts, smooth=True, **kw)
+        self.bind("<Enter>",         self._on_enter)
+        self.bind("<Leave>",         self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
 
-    def _draw(self, color):
-        self.delete("all")
-        self._round_rect(2, 2, self._w-2, self._h-2, self._r, fill=color, outline="")
-        self.create_text(self._w//2, self._h//2, text=self._text,
-                          fill=self._fg if self._enabled else TEXT2,
-                          font=("Segoe UI", self._fsize, "bold"))
+    def _on_enter(self, _):
+        if self._enabled:
+            self.config(bg=self._hover)
 
-    def _on_enter(self, _): 
-        if self._enabled: self._draw(self._hover)
-    def _on_leave(self, _): 
-        if self._enabled: self._draw(self._bg)
+    def _on_leave(self, _):
+        if self._enabled:
+            self.config(bg=self._bg)
+
     def _on_press(self, _):
-        if self._enabled and self._cmd: self._cmd()
+        if self._enabled and self._cmd:
+            self._cmd()
 
     def set_enabled(self, v: bool):
         self._enabled = v
-        self._draw(self._bg if v else DARK3)
+        if v:
+            self.config(bg=self._bg, fg=self._fg, cursor="hand2")
+        else:
+            self.config(bg=DARK3, fg=TEXT2, cursor="")
 
 
 # ──────────────────────────────────────────────────────────
@@ -373,7 +382,7 @@ class DroneApp(tk.Tk):
                   font=("Segoe UI",9)).pack(side="left", fill="x", expand=True, padx=4)
         FlatButton(f, "찾기", command=cmd,
                     bg=DARK3, hover=DARK2, fg=TEXT2,
-                    width=40, height=24, radius=4, font_size=9).pack(side="right")
+                    width=50, height=26, font_size=9).pack(side="right", padx=(4,0))
 
     def _slider(self, parent, label, lo, hi, init, fmt=".2f"):
         s = LabeledSlider(parent, label, lo, hi, init,
