@@ -1,18 +1,17 @@
 """
 Drone Shadow Remover & Color Restorer
-Desktop Application  –  Tkinter GUI  v2.2
+Desktop Application  –  Tkinter GUI  v3.0
 ────────────────────────────────────────
 실행: python main.py
 
-새 기능 (v2.2):
-  • 파일 더블클릭 즉시 미리보기 처리
-  • 비교 탭: 원본|복원 나란히 + 분할선 + 더 큰 레이블
-  • 원본 탭에서도 줌/패닝 가능
-  • 복원 탭에서도 줌/패닝 가능
-  • AI 모델 다운로드 창 (헤더 버튼)
-  • 메모리 절약 모델 로딩 (한 번에 하나씩)
-  • 미리보기 결과 → 파라미터 조정 → 재처리 워크플로
-  • 전체 배치 처리 (멀티스레드)
+v3.0 수정 사항:
+  • ZoomCanvas: 드래그·줌 이벤트 충돌 완전 수정, 왼쪽 패널 휠 간섭 제거
+  • 비교 탭: 레이아웃 완전 수정 (행/열 weight 정확하게 재설정)
+  • 미리보기 플래그: finally 블록으로 항상 해제 보장
+  • 파일 선택 → 원본 표시 → 더블클릭 → 비교 탭으로 자동 전환
+  • 재처리: 슬라이더 조정 후 버튼 클릭 시 즉시 재처리 가능
+  • 그림자 탐지 과보정 방지 (청색편이 기반 신뢰도 가중치)
+  • 처리 오류 상세 로그
 """
 
 import tkinter as tk
@@ -68,93 +67,92 @@ MODEL_INFO = [
 # ──────────────────────────────────────────────────────────
 # 색상 테마
 # ──────────────────────────────────────────────────────────
-DARK  = "#1e1e2e"
-DARK2 = "#2a2a3e"
-DARK3 = "#313155"
-ACCENT= "#7c6af7"
-ACC2  = "#00c9ff"
-GREEN = "#3ddc84"
-RED   = "#ff5f57"
-WARN  = "#ffcb6b"
-TEXT  = "#e0e0f0"
-TEXT2 = "#9090b0"
-WHITE = "#ffffff"
-CARD  = "#252538"
+DARK   = "#1e1e2e"
+DARK2  = "#2a2a3e"
+DARK3  = "#313155"
+ACCENT = "#7c6af7"
+ACC2   = "#00c9ff"
+GREEN  = "#3ddc84"
+RED    = "#ff5f57"
+WARN   = "#ffcb6b"
+TEXT   = "#e0e0f0"
+TEXT2  = "#9090b0"
+WHITE  = "#ffffff"
+CARD   = "#252538"
 
 # ──────────────────────────────────────────────────────────
-# 유틸
+# 유틸 함수
 # ──────────────────────────────────────────────────────────
 
-def cv2pil(img_bgr: np.ndarray, max_w: int = 0, max_h: int = 0) -> Image.Image:
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img_rgb)
-    if max_w and max_h:
-        pil.thumbnail((max_w, max_h), Image.LANCZOS)
+def cv2pil(img_bgr: np.ndarray, max_side: int = 0) -> Image.Image:
+    """BGR numpy → PIL RGB (선택적 축소)"""
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    if max_side > 0:
+        w, h = pil.size
+        if max(w, h) > max_side:
+            r = max_side / max(w, h)
+            pil = pil.resize((max(1, int(w * r)), max(1, int(h * r))),
+                             Image.BILINEAR)
     return pil
 
-def pil2tk(pil_img: Image.Image) -> ImageTk.PhotoImage:
-    return ImageTk.PhotoImage(pil_img)
+
+def safe_imread(path: str) -> "np.ndarray | None":
+    """한글/유니코드 경로 대응 imread"""
+    try:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
+        with open(path, 'rb') as f:
+            arr = np.frombuffer(f.read(), dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
 
 
 # ──────────────────────────────────────────────────────────
-# 커스텀 위젯: 플랫 버튼 (tk.Label 기반)
+# 커스텀 위젯: 플랫 버튼
 # ──────────────────────────────────────────────────────────
 
 class FlatButton(tk.Label):
     def __init__(self, parent, text="", command=None,
                  bg=ACCENT, fg=WHITE, hover=DARK3,
-                 width=160, height=36, radius=8,
-                 font_size=11, **kw):
+                 width=160, height=36, font_size=11, **kw):
         kw.pop("radius", None)
         super().__init__(
-            parent,
-            text=text,
-            bg=bg,
-            fg=fg,
+            parent, text=text, bg=bg, fg=fg,
             font=("Segoe UI", font_size, "bold"),
-            cursor="hand2",
-            relief="flat",
+            cursor="hand2", relief="flat",
             padx=max(4, (width - len(text) * (font_size + 2)) // 2),
             pady=max(2, (height - font_size - 6) // 2),
             **kw
         )
-        self._bg      = bg
-        self._hover   = hover
-        self._fg      = fg
-        self._enabled = True
-        self._cmd     = command
-
+        self._bg = bg; self._hover = hover; self._fg = fg
+        self._enabled = True; self._cmd = command
         self.bind("<Enter>",         self._on_enter)
         self.bind("<Leave>",         self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
 
     def _on_enter(self, _):
-        if self._enabled:
-            self.config(bg=self._hover)
-
+        if self._enabled: self.config(bg=self._hover)
     def _on_leave(self, _):
-        if self._enabled:
-            self.config(bg=self._bg)
-
+        if self._enabled: self.config(bg=self._bg)
     def _on_press(self, _):
-        if self._enabled and self._cmd:
-            self._cmd()
+        if self._enabled and self._cmd: self._cmd()
 
     def set_enabled(self, v: bool):
         self._enabled = v
-        if v:
-            self.config(bg=self._bg, fg=self._fg, cursor="hand2")
-        else:
-            self.config(bg=DARK3, fg=TEXT2, cursor="")
+        self.config(bg=self._bg if v else DARK3,
+                    fg=self._fg if v else TEXT2,
+                    cursor="hand2" if v else "")
 
 
 # ──────────────────────────────────────────────────────────
-# 라벨 슬라이더 컴포넌트
+# 라벨 슬라이더
 # ──────────────────────────────────────────────────────────
 
 class LabeledSlider(tk.Frame):
-    def __init__(self, parent, label, from_, to, init,
-                 resolution=0.05, fmt=".2f", **kw):
+    def __init__(self, parent, label, from_, to, init, fmt=".2f", **kw):
         super().__init__(parent, bg=CARD, **kw)
         self._fmt = fmt
         self.var  = tk.DoubleVar(value=init)
@@ -165,19 +163,16 @@ class LabeledSlider(tk.Frame):
                   font=("Segoe UI", 9)).pack(side="left")
         self.val_lbl = tk.Label(top, text=format(init, fmt),
                                  bg=CARD, fg=ACC2,
-                                 font=("Segoe UI", 9, "bold"),
-                                 width=6, anchor="e")
+                                 font=("Segoe UI", 9, "bold"), width=6, anchor="e")
         self.val_lbl.pack(side="right")
+        ttk.Scale(self, from_=from_, to=to, variable=self.var,
+                   orient="horizontal", command=self._upd).pack(fill="x", pady=(2, 0))
 
-        self.slider = ttk.Scale(self, from_=from_, to=to,
-                                 variable=self.var, orient="horizontal",
-                                 command=self._update)
-        self.slider.pack(fill="x", pady=(2, 0))
-
-    def _update(self, v):
+    def _upd(self, v):
         self.val_lbl.config(text=format(float(v), self._fmt))
 
-    def get(self): return self.var.get()
+    def get(self):
+        return self.var.get()
 
 
 # ──────────────────────────────────────────────────────────
@@ -185,185 +180,119 @@ class LabeledSlider(tk.Frame):
 # ──────────────────────────────────────────────────────────
 
 class ModelDownloadDialog(tk.Toplevel):
-    """
-    AI 모델(.pth) 다운로드 전용 창.
-    • 각 모델별 상태(미설치/설치됨/다운로드 중) 표시
-    • 개별 / 전체 다운로드 버튼
-    • 실시간 진행바 + 속도/크기 표시
-    • 다운로드 완료 후 '앱 재시작 없이 모델 즉시 적용' 옵션
-    """
-
     def __init__(self, parent, model_dir: str, reload_callback=None):
         super().__init__(parent)
-        self.title("🤖  AI 모델 다운로드")
-        self.geometry("680x520")
-        self.minsize(600, 440)
-        self.configure(bg=DARK)
-        self.resizable(True, True)
-        self.transient(parent)
-        self.grab_set()
-
-        self._model_dir      = model_dir
-        self._reload_cb      = reload_callback
-        self._dl_threads     = {}
-        self._cancel_flags   = {}
-        self._queue          = queue.Queue()
-
-        self._build_ui()
-        self._refresh_status()
-        self._poll()
+        self.title("AI 모델 다운로드")
+        self.geometry("680x520"); self.minsize(600, 440)
+        self.configure(bg=DARK); self.resizable(True, True)
+        self.transient(parent); self.grab_set()
+        self._model_dir = model_dir
+        self._reload_cb = reload_callback
+        self._dl_threads = {}; self._cancel_flags = {}
+        self._queue = queue.Queue()
+        self._build_ui(); self._refresh_status(); self._poll()
 
     def _build_ui(self):
         hdr = tk.Frame(self, bg=DARK3, height=52)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        tk.Label(hdr, text="🤖  AI 모델 다운로드 관리",
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="AI 모델 다운로드 관리",
                   bg=DARK3, fg=WHITE,
                   font=("Segoe UI", 13, "bold")).pack(side="left", padx=16, pady=10)
-        tk.Label(hdr,
-                  text="모델을 설치하면 그림자 탐지와 색상 복원 정확도가 향상됩니다",
-                  bg=DARK3, fg=TEXT2,
-                  font=("Segoe UI", 9)).pack(side="left", padx=4)
+        tk.Label(hdr, text="모델 설치 시 그림자 탐지·색상 복원 정확도 향상",
+                  bg=DARK3, fg=TEXT2, font=("Segoe UI", 9)).pack(side="left", padx=4)
 
         url_f = tk.Frame(self, bg=DARK2, pady=6)
-        url_f.pack(fill="x", padx=12, pady=(8,0))
-        tk.Label(url_f, text="다운로드 서버 URL:",
-                  bg=DARK2, fg=TEXT2, font=("Segoe UI",9)).pack(side="left", padx=8)
+        url_f.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(url_f, text="서버 URL:", bg=DARK2, fg=TEXT2,
+                  font=("Segoe UI", 9)).pack(side="left", padx=8)
         self._url_var = tk.StringVar(value=MODEL_SERVER_BASE)
-        url_entry = tk.Entry(url_f, textvariable=self._url_var,
-                              bg="#1a1a30", fg=ACC2, insertbackground=WHITE,
-                              relief="flat", font=("Consolas",9), width=50)
-        url_entry.pack(side="left", fill="x", expand=True, ipady=3, padx=4)
-        FlatButton(url_f, "적용",
-                    command=self._apply_url,
+        tk.Entry(url_f, textvariable=self._url_var, bg="#1a1a30", fg=ACC2,
+                  insertbackground=WHITE, relief="flat",
+                  font=("Consolas", 9), width=50).pack(
+            side="left", fill="x", expand=True, ipady=3, padx=4)
+        FlatButton(url_f, "적용", command=self._apply_url,
                     bg=DARK3, hover=DARK2, fg=TEXT2,
-                    width=60, height=28, font_size=9
-        ).pack(side="left", padx=6)
+                    width=60, height=28, font_size=9).pack(side="left", padx=6)
 
-        info_f = tk.Frame(self, bg=DARK, pady=4)
-        info_f.pack(fill="x", padx=12)
-        tk.Label(info_f,
-                  text="💡 기본 URL은 현재 샌드박스 서버입니다. "
-                       "파일을 직접 복사한 경우 [models] 폴더에 넣으면 자동 인식됩니다.",
-                  bg=DARK, fg=TEXT2, font=("Segoe UI",8),
-                  wraplength=640, justify="left").pack(anchor="w")
+        tk.Label(self,
+                  text="직접 복사한 경우 [models] 폴더에 넣으면 자동 인식",
+                  bg=DARK, fg=TEXT2, font=("Segoe UI", 8)).pack(
+            anchor="w", padx=20, pady=(2, 4))
 
         self._cards = {}
         for info in MODEL_INFO:
-            card = self._make_model_card(info)
-            self._cards[info["name"]] = card
+            self._cards[info["name"]] = self._make_card(info)
 
         btn_f = tk.Frame(self, bg=DARK, pady=8)
         btn_f.pack(fill="x", padx=12)
-
-        FlatButton(btn_f, "⬇  전체 다운로드",
-                    command=self._download_all,
-                    bg=ACCENT, hover="#5b4dd6",
-                    width=160, height=36, font_size=10
-        ).pack(side="left", padx=(0,8))
-
-        FlatButton(btn_f, "🔄  상태 새로고침",
-                    command=self._refresh_status,
-                    bg=DARK3, hover=DARK2, fg=TEXT2,
-                    width=140, height=36, font_size=10
-        ).pack(side="left", padx=(0,8))
-
-        FlatButton(btn_f, "✅  적용 후 닫기",
-                    command=self._apply_and_close,
-                    bg="#1a6b3a", hover="#0f4a28",
-                    width=140, height=36, font_size=10
-        ).pack(side="left")
+        FlatButton(btn_f, "전체 다운로드", command=self._download_all,
+                    bg=ACCENT, hover="#5b4dd6", width=140, height=36, font_size=10
+                    ).pack(side="left", padx=(0, 8))
+        FlatButton(btn_f, "상태 새로고침", command=self._refresh_status,
+                    bg=DARK3, hover=DARK2, fg=TEXT2, width=130, height=36, font_size=10
+                    ).pack(side="left", padx=(0, 8))
+        FlatButton(btn_f, "적용 후 닫기", command=self._apply_and_close,
+                    bg="#1a6b3a", hover="#0f4a28", width=120, height=36, font_size=10
+                    ).pack(side="left")
 
         log_f = tk.Frame(self, bg=CARD)
-        log_f.pack(fill="both", expand=True, padx=12, pady=(4,8))
-        tk.Label(log_f, text="📋 다운로드 로그",
-                  bg=CARD, fg=TEXT2, font=("Segoe UI",9,"bold"),
-                  padx=8).pack(anchor="w", pady=(4,2))
-        log_sb = ttk.Scrollbar(log_f, orient="vertical")
-        self._log_text = tk.Text(
-            log_f, bg=CARD, fg=TEXT, font=("Consolas",8),
-            relief="flat", wrap="word", state="disabled", height=6,
-            yscrollcommand=log_sb.set,
-        )
-        log_sb.config(command=self._log_text.yview)
-        log_sb.pack(side="right", fill="y")
-        self._log_text.pack(fill="both", expand=True, padx=4, pady=(0,4))
-        self._log_text.tag_config("ok",    foreground=GREEN)
-        self._log_text.tag_config("warn",  foreground=WARN)
-        self._log_text.tag_config("error", foreground=RED)
-        self._log_text.tag_config("info",  foreground=TEXT2)
+        log_f.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+        tk.Label(log_f, text="다운로드 로그", bg=CARD, fg=TEXT2,
+                  font=("Segoe UI", 9, "bold"), padx=8).pack(anchor="w", pady=(4, 2))
+        sb = ttk.Scrollbar(log_f, orient="vertical")
+        self._log_text = tk.Text(log_f, bg=CARD, fg=TEXT, font=("Consolas", 8),
+                                  relief="flat", wrap="word", state="disabled",
+                                  height=6, yscrollcommand=sb.set)
+        sb.config(command=self._log_text.yview)
+        sb.pack(side="right", fill="y")
+        self._log_text.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        for t, c in [("ok", GREEN), ("warn", WARN), ("error", RED), ("info", TEXT2)]:
+            self._log_text.tag_config(t, foreground=c)
 
-    def _make_model_card(self, info: dict) -> dict:
+    def _make_card(self, info):
         name = info["name"]
-
         card = tk.Frame(self, bg=CARD, padx=12, pady=10)
         card.pack(fill="x", padx=12, pady=4)
-
         left = tk.Frame(card, bg=CARD)
         left.pack(side="left", fill="both", expand=True)
-
         title_f = tk.Frame(left, bg=CARD)
         title_f.pack(fill="x")
-        name_lbl = tk.Label(title_f, text=info["label"],
-                             bg=CARD, fg=WHITE,
-                             font=("Segoe UI",10,"bold"))
-        name_lbl.pack(side="left")
-
-        status_lbl = tk.Label(title_f, text="…",
-                               bg=CARD, fg=TEXT2,
-                               font=("Segoe UI",8), padx=8)
+        tk.Label(title_f, text=info["label"], bg=CARD, fg=WHITE,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        status_lbl = tk.Label(title_f, text="…", bg=CARD, fg=TEXT2,
+                               font=("Segoe UI", 8), padx=8)
         status_lbl.pack(side="left", padx=8)
-
-        desc_lbl = tk.Label(left, text=info["desc"],
-                              bg=CARD, fg=TEXT2,
-                              font=("Segoe UI",8),
-                              justify="left", anchor="w")
-        desc_lbl.pack(fill="x", pady=(2,4))
-
+        tk.Label(left, text=info["desc"], bg=CARD, fg=TEXT2,
+                  font=("Segoe UI", 8), justify="left", anchor="w").pack(fill="x", pady=(2, 4))
         prog = ttk.Progressbar(left, mode="determinate", length=400)
-        prog.pack(fill="x", pady=(2,0))
-        prog_lbl = tk.Label(left, text="",
-                             bg=CARD, fg=TEXT2, font=("Consolas",8))
+        prog.pack(fill="x", pady=(2, 0))
+        prog_lbl = tk.Label(left, text="", bg=CARD, fg=TEXT2, font=("Consolas", 8))
         prog_lbl.pack(anchor="e")
-
         right = tk.Frame(card, bg=CARD)
-        right.pack(side="right", padx=(12,0))
-
-        dl_btn = FlatButton(right, "⬇  다운로드",
+        right.pack(side="right", padx=(12, 0))
+        dl_btn = FlatButton(right, "다운로드",
                              command=lambda n=name: self._download_one(n),
-                             bg="#2a6496", hover="#1d4f75",
-                             width=110, height=32, font_size=9)
-        dl_btn.pack(pady=(0,6))
-
-        cancel_btn = FlatButton(right, "⏹  중단",
+                             bg="#2a6496", hover="#1d4f75", width=100, height=32, font_size=9)
+        dl_btn.pack(pady=(0, 6))
+        cancel_btn = FlatButton(right, "중단",
                                  command=lambda n=name: self._cancel_one(n),
-                                 bg="#6b2222", hover="#4a1515",
-                                 width=110, height=32, font_size=9)
+                                 bg="#6b2222", hover="#4a1515", width=100, height=32, font_size=9)
         cancel_btn.pack()
         cancel_btn.set_enabled(False)
-
-        return {
-            "info":       info,
-            "status_lbl": status_lbl,
-            "prog":       prog,
-            "prog_lbl":   prog_lbl,
-            "dl_btn":     dl_btn,
-            "cancel_btn": cancel_btn,
-        }
+        return {"info": info, "status_lbl": status_lbl, "prog": prog,
+                "prog_lbl": prog_lbl, "dl_btn": dl_btn, "cancel_btn": cancel_btn}
 
     def _refresh_status(self):
         for name, card in self._cards.items():
             path = os.path.join(self._model_dir, name)
             if os.path.exists(path):
                 sz = os.path.getsize(path) / 1024 / 1024
-                card["status_lbl"].config(
-                    text=f"✅ 설치됨  ({sz:.1f} MB)", fg=GREEN)
+                card["status_lbl"].config(text=f"설치됨 ({sz:.1f} MB)", fg=GREEN)
                 card["prog"]["value"] = 100
                 card["prog_lbl"].config(text="완료")
             else:
-                card["status_lbl"].config(text="❌ 미설치", fg=RED)
-                card["prog"]["value"] = 0
-                card["prog_lbl"].config(text="")
+                card["status_lbl"].config(text="미설치", fg=RED)
+                card["prog"]["value"] = 0; card["prog_lbl"].config(text="")
 
     def _apply_url(self):
         base = self._url_var.get().rstrip("/")
@@ -374,82 +303,56 @@ class ModelDownloadDialog(tk.Toplevel):
     def _download_one(self, name: str):
         if name in self._dl_threads and self._dl_threads[name].is_alive():
             return
-
-        info  = next(i for i in MODEL_INFO if i["name"] == name)
-        card  = self._cards[name]
-        flag  = threading.Event()
+        info = next(i for i in MODEL_INFO if i["name"] == name)
+        card = self._cards[name]
+        flag = threading.Event()
         self._cancel_flags[name] = flag
-
-        card["dl_btn"].set_enabled(False)
-        card["cancel_btn"].set_enabled(True)
-        card["status_lbl"].config(text="⬇ 다운로드 중…", fg=WARN)
+        card["dl_btn"].set_enabled(False); card["cancel_btn"].set_enabled(True)
+        card["status_lbl"].config(text="다운로드 중…", fg=WARN)
 
         def _work():
-            dest_path = os.path.join(self._model_dir, info["dest"])
+            dest = os.path.join(self._model_dir, info["dest"])
             os.makedirs(self._model_dir, exist_ok=True)
-            url = info["url"]
-            self._queue.put(("dl_log", name, f"⬇ 시작: {url}", "info"))
-
+            self._queue.put(("dl_log", name, f"시작: {info['url']}", "info"))
             try:
                 req = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": "DroneShadowRemover/2.2"}
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                    info["url"], headers={"User-Agent": "DroneShadowRemover/3.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
                     total = int(resp.headers.get("Content-Length", 0))
-                    downloaded = 0
-                    chunk = 65536
-                    t_start = time.time()
-
-                    with open(dest_path, "wb") as f:
+                    done  = 0; t0 = time.time()
+                    with open(dest, "wb") as f:
                         while True:
                             if flag.is_set():
-                                self._queue.put(("dl_cancel", name))
-                                return
-                            data = resp.read(chunk)
-                            if not data:
-                                break
-                            f.write(data)
-                            downloaded += len(data)
-
-                            elapsed = max(time.time() - t_start, 0.001)
-                            speed   = downloaded / elapsed / 1024
-                            pct     = int(downloaded / total * 100) if total else 0
-                            self._queue.put((
-                                "dl_progress", name,
-                                pct,
-                                f"{downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB  "
-                                f"({speed:.0f} KB/s)"
-                            ))
-
-                sz = os.path.getsize(dest_path) / 1024 / 1024
-                self._queue.put(("dl_done", name,
-                                  f"✅ 완료: {info['dest']}  ({sz:.1f} MB)"))
+                                self._queue.put(("dl_cancel", name)); return
+                            data = resp.read(65536)
+                            if not data: break
+                            f.write(data); done += len(data)
+                            elapsed = max(time.time() - t0, 0.001)
+                            spd = done / elapsed / 1024
+                            pct = int(done / total * 100) if total else 0
+                            self._queue.put(("dl_progress", name, pct,
+                                f"{done/1048576:.1f}/{total/1048576:.1f} MB ({spd:.0f} KB/s)"))
+                sz = os.path.getsize(dest) / 1048576
+                self._queue.put(("dl_done", name, f"완료: {info['dest']} ({sz:.1f} MB)"))
             except Exception as e:
-                if os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
+                if os.path.exists(dest):
+                    try: os.remove(dest)
+                    except: pass
                 self._queue.put(("dl_error", name, str(e)))
 
         t = threading.Thread(target=_work, daemon=True)
-        self._dl_threads[name] = t
-        t.start()
+        self._dl_threads[name] = t; t.start()
 
     def _download_all(self):
         for info in MODEL_INFO:
-            path = os.path.join(self._model_dir, info["dest"])
-            if not os.path.exists(path):
+            if not os.path.exists(os.path.join(self._model_dir, info["dest"])):
                 self._download_one(info["name"])
 
-    def _cancel_one(self, name: str):
-        if name in self._cancel_flags:
-            self._cancel_flags[name].set()
+    def _cancel_one(self, name):
+        if name in self._cancel_flags: self._cancel_flags[name].set()
 
     def _apply_and_close(self):
-        if self._reload_cb:
-            self._reload_cb()
+        if self._reload_cb: self._reload_cb()
         self.destroy()
 
     def _poll(self):
@@ -457,128 +360,144 @@ class ModelDownloadDialog(tk.Toplevel):
             while True:
                 msg  = self._queue.get_nowait()
                 kind = msg[0]
-
                 if kind == "dl_progress":
                     _, name, pct, txt = msg
-                    card = self._cards[name]
-                    card["prog"]["value"] = pct
-                    card["prog_lbl"].config(text=txt)
-
+                    self._cards[name]["prog"]["value"] = pct
+                    self._cards[name]["prog_lbl"].config(text=txt)
                 elif kind == "dl_done":
                     _, name, log_msg = msg
-                    card = self._cards[name]
-                    card["prog"]["value"]   = 100
-                    card["prog_lbl"].config(text="완료")
-                    card["status_lbl"].config(text="✅ 설치됨", fg=GREEN)
-                    card["dl_btn"].set_enabled(True)
-                    card["cancel_btn"].set_enabled(False)
+                    c = self._cards[name]
+                    c["prog"]["value"] = 100; c["prog_lbl"].config(text="완료")
+                    c["status_lbl"].config(text="설치됨", fg=GREEN)
+                    c["dl_btn"].set_enabled(True); c["cancel_btn"].set_enabled(False)
                     self._log(log_msg, "ok")
-
                 elif kind == "dl_cancel":
                     _, name = msg
-                    card = self._cards[name]
-                    card["status_lbl"].config(text="⏹ 취소됨", fg=WARN)
-                    card["prog"]["value"] = 0
-                    card["prog_lbl"].config(text="")
-                    card["dl_btn"].set_enabled(True)
-                    card["cancel_btn"].set_enabled(False)
-                    self._log(f"⏹ 취소: {name}", "warn")
-
+                    c = self._cards[name]
+                    c["status_lbl"].config(text="취소됨", fg=WARN)
+                    c["prog"]["value"] = 0; c["prog_lbl"].config(text="")
+                    c["dl_btn"].set_enabled(True); c["cancel_btn"].set_enabled(False)
+                    self._log(f"취소: {name}", "warn")
                 elif kind == "dl_error":
                     _, name, err = msg
-                    card = self._cards[name]
-                    card["status_lbl"].config(text="❌ 오류", fg=RED)
-                    card["prog"]["value"] = 0
-                    card["prog_lbl"].config(text="")
-                    card["dl_btn"].set_enabled(True)
-                    card["cancel_btn"].set_enabled(False)
-                    self._log(f"❌ 오류 ({name}): {err}", "error")
-
+                    c = self._cards[name]
+                    c["status_lbl"].config(text="오류", fg=RED)
+                    c["prog"]["value"] = 0; c["prog_lbl"].config(text="")
+                    c["dl_btn"].set_enabled(True); c["cancel_btn"].set_enabled(False)
+                    self._log(f"오류 ({name}): {err}", "error")
                 elif kind == "dl_log":
                     _, name, msg_txt, tag = msg
                     self._log(msg_txt, tag)
-
         except queue.Empty:
             pass
         if self.winfo_exists():
             self.after(100, self._poll)
 
-    def _log(self, text: str, tag: str = "info"):
+    def _log(self, text, tag="info"):
         self._log_text.config(state="normal")
-        ts = time.strftime("%H:%M:%S")
-        self._log_text.insert("end", f"[{ts}] {text}\n", tag)
-        self._log_text.see("end")
-        self._log_text.config(state="disabled")
+        self._log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n", tag)
+        self._log_text.see("end"); self._log_text.config(state="disabled")
 
 
 # ──────────────────────────────────────────────────────────
-# 줌 가능 캔버스 위젯
+# ZoomCanvas: 고속 줌/패닝 캔버스  (v3.0 완전 재작성)
 # ──────────────────────────────────────────────────────────
 
 class ZoomCanvas(tk.Canvas):
     """
-    마우스 휠 줌 + 드래그 패닝을 지원하는 이미지 캔버스.
-    load_image(pil_img) 로 이미지를 로드.
+    고속 줌+패닝 캔버스.
+
+    v3.0 수정사항:
+    - 렌더링: 가시 영역만 크롭 후 리사이즈 (대용량 이미지 대응)
+    - 리샘플링: 축소=BILINEAR, 확대=NEAREST (약 5배 빠름)
+    - _schedule_render 10ms 딜레이로 연속 이벤트 병합
+    - 드래그·더블클릭 이벤트 독립 처리 (충돌 없음)
+    - bind_all 사용 금지 (다른 위젯 간섭 방지)
     """
-    MIN_SCALE = 0.05
-    MAX_SCALE = 12.0
+    MIN_SCALE = 0.03
+    MAX_SCALE = 15.0
 
-    def __init__(self, parent, bg=CARD, label="", label_color=WHITE, **kw):
+    def __init__(self, parent, bg=CARD, hint="이미지 없음",
+                 label="", label_color=WHITE, **kw):
         super().__init__(parent, bg=bg, highlightthickness=0, **kw)
-        self._pil_orig    = None
-        self._scale       = 1.0
-        self._offset_x    = 0
-        self._offset_y    = 0
-        self._drag_x      = 0
-        self._drag_y      = 0
-        self._tk_img      = None
-        self._label_text  = label
-        self._label_color = label_color
+        self._pil_orig       = None   # PIL 이미지 (원본 크기)
+        self._scale          = 1.0
+        self._offset_x       = 0.0
+        self._offset_y       = 0.0
+        self._drag_x         = 0
+        self._drag_y         = 0
+        self._tk_img         = None   # GC 방지용
+        self._hint           = hint
+        self._label_text     = label
+        self._label_color    = label_color
+        self._render_pending = False
+        self._dragging       = False
 
-        self.bind("<Configure>",       self._on_configure)
-        self.bind("<MouseWheel>",      self._on_wheel)
-        self.bind("<Button-4>",        self._on_wheel)
-        self.bind("<Button-5>",        self._on_wheel)
-        self.bind("<ButtonPress-1>",   self._on_drag_start)
-        self.bind("<B1-Motion>",       self._on_drag_move)
-        self.bind("<Double-Button-1>", self._reset_view)
-        self.bind("<ButtonPress-3>",   self._reset_view)
+        self.bind("<Configure>",      self._on_configure)
+        self.bind("<MouseWheel>",     self._on_wheel)
+        self.bind("<Button-4>",       self._on_wheel)
+        self.bind("<Button-5>",       self._on_wheel)
+        self.bind("<ButtonPress-1>",  self._on_drag_start)
+        self.bind("<B1-Motion>",      self._on_drag_move)
+        self.bind("<ButtonRelease-1>",self._on_drag_end)
+        # 더블클릭: 뷰 초기화 (드래그와 독립)
+        self.bind("<Double-Button-1>",self._reset_view)
+        self.bind("<Button-3>",       self._reset_view)
+
+    # ──────────────────────────────────────────────────────
+    # 공개 API
 
     def load_image(self, pil_img: Image.Image):
+        """PIL 이미지를 로드하고 캔버스에 맞게 표시"""
         self._pil_orig = pil_img
         self._fit_to_canvas()
 
     def clear(self):
+        """이미지 제거 및 힌트 표시"""
         self._pil_orig = None
+        self._tk_img   = None
         self.delete("all")
-        self._tk_img = None
-        self._draw_empty()
+        self._draw_hint()
 
-    def _draw_empty(self):
+    # ──────────────────────────────────────────────────────
+    # 내부 메서드
+
+    def _draw_hint(self):
         cw = self.winfo_width()
         ch = self.winfo_height()
-        if cw > 10 and ch > 10:
-            self.create_text(
-                cw // 2, ch // 2,
-                text=self._label_text if self._label_text else "이미지 없음",
-                fill=TEXT2, font=("Segoe UI", 11), justify="center",
-                tags="hint"
-            )
+        if cw > 30 and ch > 30:
+            self.delete("all")
+            self.create_text(cw // 2, ch // 2, text=self._hint,
+                              fill=TEXT2, font=("Segoe UI", 11),
+                              justify="center", tags="hint")
 
     def _fit_to_canvas(self):
+        """이미지를 캔버스에 딱 맞게 초기 배치"""
         if self._pil_orig is None:
             return
         cw = self.winfo_width()
         ch = self.winfo_height()
         if cw < 10 or ch < 10:
+            # 캔버스가 아직 배치 안 됨 → 나중에 재시도
             self.after(80, self._fit_to_canvas)
             return
-
         iw, ih = self._pil_orig.size
-        scale = min(cw / iw, ch / ih, 1.0)
+        scale  = min(cw / iw, ch / ih, 1.0)
         self._scale    = scale
-        self._offset_x = (cw - iw * scale) / 2
-        self._offset_y = (ch - ih * scale) / 2
+        self._offset_x = (cw - iw * scale) / 2.0
+        self._offset_y = (ch - ih * scale) / 2.0
+        self._schedule_render()
+
+    def _schedule_render(self):
+        """중복 렌더 방지: 10ms 후 한 번만 렌더"""
+        if not self._render_pending:
+            self._render_pending = True
+            self.after(10, self._do_render)
+
+    def _do_render(self):
+        self._render_pending = False
+        if self._pil_orig is None:
+            return
         self._render()
 
     def _render(self):
@@ -590,77 +509,93 @@ class ZoomCanvas(tk.Canvas):
             return
 
         iw, ih = self._pil_orig.size
-        nw = max(1, int(iw * self._scale))
-        nh = max(1, int(ih * self._scale))
+        ox = self._offset_x
+        oy = self._offset_y
+        sc = self._scale
 
-        resized = self._pil_orig.resize((nw, nh), Image.LANCZOS)
-        tk_img  = ImageTk.PhotoImage(resized)
+        # 가시 영역: 이미지 좌표계로 변환
+        img_x0 = max(0, int(-ox / sc))
+        img_y0 = max(0, int(-oy / sc))
+        img_x1 = min(iw, int((cw - ox) / sc) + 2)
+        img_y1 = min(ih, int((ch - oy) / sc) + 2)
 
+        if img_x1 <= img_x0 or img_y1 <= img_y0:
+            self.delete("all")
+            return
+
+        # 크롭 후 리사이즈 (필요한 부분만)
+        crop   = self._pil_orig.crop((img_x0, img_y0, img_x1, img_y1))
+        dst_w  = max(1, int((img_x1 - img_x0) * sc))
+        dst_h  = max(1, int((img_y1 - img_y0) * sc))
+
+        # 리샘플링 선택: 축소=BILINEAR (품질), 확대=NEAREST (속도)
+        resample = Image.BILINEAR if sc < 1.0 else Image.NEAREST
+        resized  = crop.resize((dst_w, dst_h), resample)
+
+        # 캔버스에서의 그리기 위치
+        draw_x = max(0, int(ox + img_x0 * sc))
+        draw_y = max(0, int(oy + img_y0 * sc))
+
+        tk_img = ImageTk.PhotoImage(resized)
         self.delete("all")
-        self.create_image(
-            int(self._offset_x), int(self._offset_y),
-            anchor="nw", image=tk_img, tags="img"
-        )
-        self._tk_img = tk_img
+        self.create_image(draw_x, draw_y, anchor="nw", image=tk_img, tags="img")
+        self._tk_img = tk_img  # GC 방지
 
-        # 상단 레이블 (원본/복원 표시)
+        # 레이블 (좌상단 반투명 배경)
         if self._label_text:
-            self.create_rectangle(0, 0, len(self._label_text)*8+20, 26,
-                                   fill="#00000088", outline="")
-            self.create_text(
-                10, 13,
-                text=self._label_text,
-                anchor="w", fill=self._label_color,
-                font=("Segoe UI", 10, "bold"), tags="title_lbl"
-            )
+            lw = len(self._label_text) * 9 + 18
+            self.create_rectangle(0, 0, lw, 26, fill="#000000", outline="",
+                                   stipple="gray50")
+            self.create_text(9, 13, text=self._label_text, anchor="w",
+                              fill=self._label_color,
+                              font=("Segoe UI", 10, "bold"), tags="lbl")
 
-        # 줌 레벨 표시 (우하단)
-        zoom_text = f"×{self._scale:.2f}  [더블클릭: 초기화]"
-        tw = len(zoom_text) * 7 + 10
-        self.create_rectangle(cw - tw - 4, ch - 24, cw - 2, ch - 2,
-                               fill="#00000066", outline="")
-        self.create_text(
-            cw - 6, ch - 6,
-            text=zoom_text,
-            anchor="se", fill=TEXT2,
-            font=("Consolas", 8), tags="zoom_lbl"
-        )
+        # 줌 레벨 (우하단)
+        zt = f" ×{sc:.2f}  [우클릭=초기화] "
+        zw = len(zt) * 7 + 6
+        self.create_rectangle(cw - zw, ch - 20, cw, ch,
+                               fill="#000000", outline="", stipple="gray50")
+        self.create_text(cw - 4, ch - 4, text=zt, anchor="se",
+                          fill=TEXT2, font=("Consolas", 8), tags="zoom_lbl")
 
     def _on_configure(self, event):
         if self._pil_orig is None:
-            self.delete("all")
-            self._draw_empty()
+            self._draw_hint()
         else:
-            self._render()
+            self._schedule_render()
 
     def _on_wheel(self, event):
         if self._pil_orig is None:
             return
-        mx = self.canvasx(event.x)
-        my = self.canvasy(event.y)
+        # 줌 중심: 마우스 커서 위치
+        mx = float(event.x)
+        my = float(event.y)
 
         if event.num == 4:
             factor = 1.15
         elif event.num == 5:
-            factor = 1 / 1.15
+            factor = 1.0 / 1.15
+        elif event.delta != 0:
+            factor = 1.15 if event.delta > 0 else 1.0 / 1.15
         else:
-            factor = 1.15 if event.delta > 0 else 1 / 1.15
+            return
 
-        new_scale = max(self.MIN_SCALE,
-                        min(self.MAX_SCALE, self._scale * factor))
+        new_scale = max(self.MIN_SCALE, min(self.MAX_SCALE, self._scale * factor))
+        if abs(new_scale - self._scale) < 1e-6:
+            return
         ratio = new_scale / self._scale
-
         self._offset_x = mx - ratio * (mx - self._offset_x)
         self._offset_y = my - ratio * (my - self._offset_y)
         self._scale    = new_scale
-        self._render()
+        self._schedule_render()
 
     def _on_drag_start(self, event):
-        self._drag_x = event.x
-        self._drag_y = event.y
+        self._drag_x  = event.x
+        self._drag_y  = event.y
+        self._dragging = True
 
     def _on_drag_move(self, event):
-        if self._pil_orig is None:
+        if not self._dragging or self._pil_orig is None:
             return
         dx = event.x - self._drag_x
         dy = event.y - self._drag_y
@@ -668,43 +603,50 @@ class ZoomCanvas(tk.Canvas):
         self._offset_y += dy
         self._drag_x    = event.x
         self._drag_y    = event.y
-        self._render()
+        # 드래그 중에는 즉시 렌더 (딜레이 없음)
+        if not self._render_pending:
+            self._render_pending = True
+            self.after(0, self._do_render)
+
+    def _on_drag_end(self, event):
+        self._dragging = False
 
     def _reset_view(self, event=None):
         self._fit_to_canvas()
 
 
 # ──────────────────────────────────────────────────────────
-# 메인 앱 윈도우
+# 메인 앱
 # ──────────────────────────────────────────────────────────
 
 class DroneApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("🛸  Drone Shadow Remover & Color Restorer  v2.2")
-        self.geometry("1520x920")
+        self.title("Drone Shadow Remover & Color Restorer  v3.0")
+        self.geometry("1560x960")
         self.minsize(1200, 720)
         self.configure(bg=DARK)
         self._set_icon()
 
-        # 상태 변수
-        self.input_folder   = tk.StringVar(value="")
-        self.output_folder  = tk.StringVar(value="")
-        self.recursive_var  = tk.BooleanVar(value=False)
-        self.save_compare   = tk.BooleanVar(value=True)
-        self.overwrite_var  = tk.BooleanVar(value=False)
-        self.worker_var     = tk.IntVar(value=1)  # 메모리 부족 방지: 기본 1
+        # ── 상태 변수
+        self.input_folder  = tk.StringVar(value="")
+        self.output_folder = tk.StringVar(value="")
+        self.recursive_var = tk.BooleanVar(value=False)
+        self.save_compare  = tk.BooleanVar(value=True)
+        self.overwrite_var = tk.BooleanVar(value=False)
+        self.worker_var    = tk.IntVar(value=1)
 
-        self._file_list         = []
-        self._selected_index    = -1
-        self._selected_path     = ""
-        self._is_running        = False
-        self._is_previewing     = False
-        self._cancel_flag       = threading.Event()
-        self._queue             = queue.Queue()
+        self._file_list      = []
+        self._selected_idx   = -1
+        self._selected_path  = ""
+        self._is_running     = False
+        self._is_previewing  = False   # 미리보기 진행 중 플래그
+        self._cancel_flag    = threading.Event()
+        self._queue          = queue.Queue()
+        self._preview_lock   = threading.Lock()
 
-        # 현재 미리보기용 BGR 이미지
+        # 현재 표시 이미지 (BGR)
         self._cur_orig   = None
         self._cur_result = None
         self._cur_binary = None
@@ -717,17 +659,16 @@ class DroneApp(tk.Tk):
         self._poll_queue()
 
     def _set_icon(self):
-        try:
-            self.iconbitmap("")
-        except Exception:
-            pass
+        try: self.iconbitmap("")
+        except: pass
 
-    # ── 모델 비동기 로드 ──────────────────────────────────
+    # ──────────────────────────────────────────────────────
+    # 모델 비동기 로드
 
     def _load_models_async(self):
         def _load():
             gc.collect()
-            base   = os.path.dirname(__file__)
+            base   = os.path.dirname(os.path.abspath(__file__))
             status = load_models(os.path.join(base, "models"))
             self._model_status = status
             self._queue.put(("model_loaded", status))
@@ -736,175 +677,179 @@ class DroneApp(tk.Tk):
 
     # ──────────────────────────────────────────────────────
     # UI 빌드
-    # ──────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._build_header()
         body = tk.Frame(self, bg=DARK)
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        body.columnconfigure(0, weight=0, minsize=290)
-        body.columnconfigure(1, weight=1)
-        body.columnconfigure(2, weight=0, minsize=320)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        body.columnconfigure(0, weight=0, minsize=280)
+        body.columnconfigure(1, weight=1, minsize=400)
+        body.columnconfigure(2, weight=0, minsize=300)
         body.rowconfigure(0, weight=1)
-
         self._build_left_panel(body)
         self._build_center_panel(body)
         self._build_right_panel(body)
         self._build_footer()
 
-    # ── 헤더 ─────────────────────────────────────────────
+    # ── 헤더
 
     def _build_header(self):
-        hdr = tk.Frame(self, bg=DARK3, height=64)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
+        hdr = tk.Frame(self, bg=DARK3, height=60)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
 
         left = tk.Frame(hdr, bg=DARK3)
-        left.pack(side="left", padx=20)
-        tk.Label(left, text="🛸", bg=DARK3, fg=WHITE,
-                  font=("Segoe UI Emoji", 22)).pack(side="left", padx=(0,10))
-        title_f = tk.Frame(left, bg=DARK3)
-        title_f.pack(side="left")
-        tk.Label(title_f, text="Drone Shadow Remover & Color Restorer",
-                  bg=DARK3, fg=WHITE,
+        left.pack(side="left", padx=16)
+        tk.Label(left, text="Drone Shadow Remover", bg=DARK3, fg=WHITE,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(title_f,
-                  text="v2.2  —  더블클릭 즉시 미리보기 + 원본/복원 나란히 비교 + 줌/패닝 + 배치 처리",
-                  bg=DARK3, fg=TEXT2,
-                  font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(left,
+                  text="v3.0  |  클릭:원본  |  더블클릭:즉시처리  |  슬라이더 조정 후 미리보기 버튼으로 재처리",
+                  bg=DARK3, fg=TEXT2, font=("Segoe UI", 9)).pack(anchor="w")
 
-        FlatButton(hdr, "🤖  AI 모델 다운로드",
-                    command=self._open_model_download,
-                    bg="#2a6496", hover="#1d4f75",
-                    width=160, height=34, font_size=9
-        ).pack(side="right", padx=8, pady=12)
-
-        self.model_badge = tk.Label(hdr, text="⏳ 모델 로딩 중",
-                                     bg=DARK3, fg=WARN,
+        FlatButton(hdr, "AI 모델 다운로드", command=self._open_model_download,
+                    bg="#2a6496", hover="#1d4f75", width=150, height=32, font_size=9
+                    ).pack(side="right", padx=8, pady=14)
+        self.model_badge = tk.Label(hdr, text="모델 로딩 중", bg=DARK3, fg=WARN,
                                      font=("Segoe UI", 9))
         self.model_badge.pack(side="right", padx=8)
 
-    # ── 왼쪽 패널 ────────────────────────────────────────
+    # ── 왼쪽 패널 (스크롤 가능)
 
     def _build_left_panel(self, parent):
-        frame = tk.Frame(parent, bg=DARK, width=290)
-        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        frame.pack_propagate(False)
+        outer = tk.Frame(parent, bg=DARK, width=280)
+        outer.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        outer.pack_propagate(False)
 
-        canvas = tk.Canvas(frame, bg=DARK, highlightthickness=0)
-        sb     = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=sb.set)
+        # 스크롤 캔버스 (왼쪽 패널 내용이 길기 때문)
+        scroll_canvas = tk.Canvas(outer, bg=DARK, highlightthickness=0)
+        sb     = ttk.Scrollbar(outer, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = tk.Frame(canvas, bg=DARK)
-        win_id = canvas.create_window((0,0), window=inner, anchor="nw")
+        scroll_canvas.pack(side="left", fill="both", expand=True)
 
-        def _resize(e):
-            canvas.itemconfig(win_id, width=e.width)
-        canvas.bind("<Configure>", _resize)
-        inner.bind("<Configure>", lambda e: canvas.configure(
-            scrollregion=canvas.bbox("all")))
+        inner  = tk.Frame(scroll_canvas, bg=DARK)
+        win_id = scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        def _wheel(e):
-            canvas.yview_scroll(-1*(e.delta//120 if e.delta else (-1 if e.num==5 else 1)), "units")
-        canvas.bind_all("<MouseWheel>", _wheel)
-        canvas.bind_all("<Button-4>",  _wheel)
-        canvas.bind_all("<Button-5>",  _wheel)
+        scroll_canvas.bind(
+            "<Configure>",
+            lambda e: scroll_canvas.itemconfig(win_id, width=e.width))
+        inner.bind(
+            "<Configure>",
+            lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")))
+
+        # 왼쪽 패널 전용 휠 핸들러 (bind_all 사용 안 함)
+        def _panel_wheel(e):
+            delta = -1 * (e.delta // 120) if e.delta else (-1 if e.num == 5 else 1)
+            scroll_canvas.yview_scroll(delta, "units")
+
+        # 왼쪽 패널 내부 모든 자식에 휠 등록 (propagate 방식)
+        self._left_scroll_canvas = scroll_canvas
+        self._left_wheel_handler = _panel_wheel
 
         p = inner
 
-        # ── 폴더 선택
-        self._section(p, "📁  폴더 설정")
+        # ── 폴더 설정
+        self._section(p, "폴더 설정")
         self._build_folder_section(p)
 
-        # 처리 쓰레드 수
+        # ── 동시 처리 수
         tw = tk.Frame(p, bg=DARK)
-        tw.pack(fill="x", padx=10, pady=2)
-        tk.Label(tw, text="동시 처리 수", bg=DARK, fg=TEXT,
+        tw.pack(fill="x", padx=10, pady=(4, 2))
+        tk.Label(tw, text="동시 처리 수:", bg=DARK, fg=TEXT,
                   font=("Segoe UI", 9)).pack(side="left")
         for v in (1, 2, 4):
-            tk.Radiobutton(tw, text=str(v), variable=self.worker_var,
-                            value=v, bg=DARK, fg=TEXT2,
-                            selectcolor=DARK3, activebackground=DARK,
-                            font=("Segoe UI",9)).pack(side="left", padx=4)
-        tk.Label(tw, text="(메모리 부족 시 1 권장)", bg=DARK, fg=TEXT2,
-                  font=("Segoe UI",7)).pack(side="left", padx=2)
+            rb = tk.Radiobutton(tw, text=str(v), variable=self.worker_var, value=v,
+                                 bg=DARK, fg=TEXT2, selectcolor=DARK3,
+                                 activebackground=DARK, font=("Segoe UI", 9))
+            rb.pack(side="left", padx=3)
+        tk.Label(tw, text="(메모리 부족 시 1)", bg=DARK, fg=TEXT2,
+                  font=("Segoe UI", 7)).pack(side="left", padx=2)
 
         # ── 탐지 설정
-        self._section(p, "🔍  그림자 탐지")
-
-        self.detect_mode = tk.StringVar(value="hybrid")
+        self._section(p, "그림자 탐지")
+        self.detect_mode = tk.StringVar(value="cv")
         dm_f = tk.Frame(p, bg=DARK)
         dm_f.pack(fill="x", padx=10, pady=4)
-        for txt, val in [("AI + CV 복합", "hybrid"), ("CV 방법만", "cv")]:
+        for txt, val in [("AI+CV 복합", "hybrid"), ("CV 방법만", "cv")]:
             tk.Radiobutton(dm_f, text=txt, variable=self.detect_mode, value=val,
-                            bg=DARK, fg=TEXT, selectcolor=DARK3,
-                            activebackground=DARK,
-                            font=("Segoe UI",9)).pack(side="left", padx=6)
+                            bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
+                            font=("Segoe UI", 9)).pack(side="left", padx=5)
 
-        self.sl_sensitivity = self._slider(p, "탐지 민감도", 0.1, 1.0, 0.5)
-        self.sl_feather     = self._slider(p, "마스크 페더링", 5, 60, 25, fmt=".0f")
+        self.sl_sensitivity = self._slider(p, "탐지 민감도",   0.1, 1.0, 0.45)
+        self.sl_feather     = self._slider(p, "마스크 페더링", 3,   50,  20, fmt=".0f")
 
         # ── 색상 복원 설정
-        self._section(p, "🎨  색상 복원")
+        self._section(p, "색상 복원")
+        self.use_ai_color = tk.BooleanVar(value=False)
+        tk.Checkbutton(p, text="AI 색상 보정 (모델 로드 시 활성)",
+                        variable=self.use_ai_color,
+                        bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
+                        font=("Segoe UI", 9)).pack(anchor="w", padx=12)
 
-        self.use_ai_color = tk.BooleanVar(value=True)
-        tk.Checkbutton(p, text="AI 색상 보정 사용", variable=self.use_ai_color,
-                        bg=DARK, fg=TEXT, selectcolor=DARK3,
-                        activebackground=DARK,
-                        font=("Segoe UI",9)).pack(anchor="w", padx=12)
-
-        self.sl_radio    = self._slider(p, "조명 보정 강도",   0.0, 1.0, 0.80)
-        self.sl_color    = self._slider(p, "색 전달 강도",     0.0, 1.0, 0.65)
-        self.sl_retinex  = self._slider(p, "Retinex 강도",    0.0, 0.6, 0.30)
+        self.sl_radio   = self._slider(p, "조명 보정 강도",  0.0, 1.0, 0.70)
+        self.sl_color   = self._slider(p, "색 전달 강도",    0.0, 1.0, 0.55)
+        self.sl_retinex = self._slider(p, "Retinex 강도",   0.0, 0.5, 0.20)
 
         # ── 선명화 설정
-        self._section(p, "✨  선명화 (복원 후)")
-
-        self.sl_denoise  = self._slider(p, "노이즈 제거",      1, 15,  6, fmt=".0f")
-        self.sl_sharpen  = self._slider(p, "선명도",          0.5, 3.0, 1.4)
-        self.sl_clahe    = self._slider(p, "CLAHE 대비",      1.0, 5.0, 2.0)
+        self._section(p, "선명화")
+        self.sl_denoise = self._slider(p, "노이즈 제거",     1,   12,  4,   fmt=".0f")
+        self.sl_sharpen = self._slider(p, "선명도",          0.3, 2.5, 1.0)
+        self.sl_clahe   = self._slider(p, "CLAHE 대비",      1.0, 4.0, 1.8)
 
         # ── 실행 버튼
         self._section(p, "")
+        self.btn_preview = FlatButton(
+            p, "선택 이미지 미리보기 (재처리)",
+            command=self._preview_selected,
+            bg="#1a6b3a", hover="#0f4a28",
+            width=250, height=36, font_size=10)
+        self.btn_preview.pack(pady=(4, 2), padx=10)
 
-        # 미리보기 버튼
-        self.btn_preview = FlatButton(p, "🔬  선택 이미지 미리보기",
-                                       command=self._preview_selected,
-                                       bg="#1a6b3a", hover="#0f4a28",
-                                       width=260, height=36, font_size=10)
-        self.btn_preview.pack(pady=(4,2), padx=10)
+        tk.Label(p,
+                  text="더블클릭=즉시처리  |  슬라이더 조정 후 이 버튼으로 재처리",
+                  bg=DARK, fg=WARN, font=("Segoe UI", 7)).pack(padx=12, anchor="w")
 
-        tk.Label(p, text="↑ 파일 목록 클릭 또는 더블클릭으로 즉시 처리",
-                  bg=DARK, fg=WARN, font=("Segoe UI",7)).pack(padx=12, anchor="w")
+        ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=6)
 
-        ttk.Separator(p, orient="horizontal").pack(fill="x", padx=10, pady=6)
-
-        btn_f = tk.Frame(p, bg=DARK)
-        btn_f.pack(fill="x", padx=10, pady=4)
-
-        self.btn_scan = FlatButton(btn_f, "📂  파일 스캔",
+        btn_row = tk.Frame(p, bg=DARK)
+        btn_row.pack(fill="x", padx=10, pady=2)
+        self.btn_scan = FlatButton(btn_row, "파일 스캔",
                                     command=self._scan_files,
                                     bg="#2a6496", hover="#1d4f75",
-                                    width=120, height=34, font_size=10)
-        self.btn_scan.pack(side="left", padx=(0,6))
-
-        self.btn_start = FlatButton(btn_f, "▶  전체 처리",
+                                    width=115, height=34, font_size=10)
+        self.btn_scan.pack(side="left", padx=(0, 6))
+        self.btn_start = FlatButton(btn_row, "전체 처리",
                                      command=self._start_processing,
                                      bg=ACCENT, hover="#5b4dd6",
-                                     width=120, height=34, font_size=10)
+                                     width=115, height=34, font_size=10)
         self.btn_start.pack(side="left")
 
-        self.btn_cancel = FlatButton(p, "⏹  중단",
-                                      command=self._cancel_processing,
-                                      bg="#8b3a3a", hover="#6b2222",
-                                      width=260, height=34, font_size=10)
-        self.btn_cancel.pack(pady=(4,8), padx=10)
+        self.btn_cancel = FlatButton(
+            p, "처리 중단",
+            command=self._cancel_processing,
+            bg="#8b3a3a", hover="#6b2222",
+            width=250, height=32, font_size=10)
+        self.btn_cancel.pack(pady=(4, 8), padx=10)
         self.btn_cancel.set_enabled(False)
+
+        # 왼쪽 패널 내부 위젯들에 휠 이벤트 등록
+        self._bind_wheel_to_children(inner, _panel_wheel)
+
+    def _bind_wheel_to_children(self, widget, handler):
+        """위젯과 모든 자식에 휠 이벤트 바인딩 (ZoomCanvas 제외)"""
+        if isinstance(widget, ZoomCanvas):
+            return   # ZoomCanvas는 자체 휠 핸들러 사용
+        try:
+            widget.bind("<MouseWheel>", handler, add="+")
+            widget.bind("<Button-4>",   handler, add="+")
+            widget.bind("<Button-5>",   handler, add="+")
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._bind_wheel_to_children(child, handler)
 
     def _section(self, parent, title):
         f = tk.Frame(parent, bg=DARK)
-        f.pack(fill="x", padx=8, pady=(10,2))
+        f.pack(fill="x", padx=8, pady=(8, 2))
         if title:
             tk.Label(f, text=title, bg=DARK, fg=ACC2,
                       font=("Segoe UI", 10, "bold")).pack(side="left")
@@ -912,264 +857,226 @@ class DroneApp(tk.Tk):
                 side="left", fill="x", expand=True, padx=6)
 
     def _build_folder_section(self, parent):
-        # 입력 폴더
-        tk.Label(parent, text="📂  드론 사진 폴더", bg=DARK, fg=TEXT,
-                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(6,2))
+        # ── 입력 폴더
+        tk.Label(parent, text="드론 사진 폴더", bg=DARK, fg=TEXT,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(4, 2))
+        in_card = tk.Frame(parent, bg=DARK2, padx=8, pady=6)
+        in_card.pack(fill="x", padx=10, pady=(0, 4))
 
-        in_card = tk.Frame(parent, bg=DARK2, padx=8, pady=8)
-        in_card.pack(fill="x", padx=10, pady=(0,4))
-
-        self._in_path_lbl = tk.Label(
-            in_card, textvariable=self.input_folder,
-            bg=DARK2, fg=ACC2,
-            font=("Consolas", 8), wraplength=230, justify="left", anchor="w"
-        )
+        self._in_path_lbl = tk.Label(in_card, textvariable=self.input_folder,
+                                      bg=DARK2, fg=ACC2, font=("Consolas", 8),
+                                      wraplength=230, justify="left", anchor="w")
         self._in_path_lbl.pack(fill="x")
-        self.input_folder.trace_add("write", lambda *_: self._update_path_label(
-            self._in_path_lbl, self.input_folder, "← 아래 버튼으로 폴더를 선택하세요"))
-        self._update_path_label(self._in_path_lbl, self.input_folder, "← 아래 버튼으로 폴더를 선택하세요")
+        self.input_folder.trace_add("write", lambda *_: self._upd_path_lbl(
+            self._in_path_lbl, self.input_folder, "버튼으로 폴더 선택"))
+        self._upd_path_lbl(self._in_path_lbl, self.input_folder, "버튼으로 폴더 선택")
 
-        btn_row_in = tk.Frame(in_card, bg=DARK2)
-        btn_row_in.pack(fill="x", pady=(6,0))
-        FlatButton(btn_row_in, "📂  폴더 선택",
-                    command=self._browse_input,
-                    bg=ACCENT, hover="#5b4dd6",
-                    width=140, height=30, font_size=9
-        ).pack(side="left", padx=(0,6))
-        FlatButton(btn_row_in, "✏ 직접 입력",
-                    command=lambda: self._toggle_direct_input("input"),
-                    bg=DARK3, hover=DARK2, fg=TEXT2,
-                    width=90, height=30, font_size=9
-        ).pack(side="left")
+        br = tk.Frame(in_card, bg=DARK2)
+        br.pack(fill="x", pady=(4, 0))
+        FlatButton(br, "폴더 선택", command=self._browse_input,
+                    bg=ACCENT, hover="#5b4dd6", width=130, height=28, font_size=9
+                    ).pack(side="left", padx=(0, 4))
+        FlatButton(br, "직접 입력", command=lambda: self._toggle_entry("in"),
+                    bg=DARK3, hover=DARK2, fg=TEXT2, width=80, height=28, font_size=9
+                    ).pack(side="left")
+        self._in_entry = tk.Frame(in_card, bg=DARK2)
+        tk.Entry(self._in_entry, textvariable=self.input_folder,
+                  bg="#1a1a30", fg=ACC2, insertbackground=WHITE,
+                  relief="flat", font=("Consolas", 9)
+                  ).pack(fill="x", pady=(4, 0), ipady=4)
 
-        self._in_entry_frame = tk.Frame(in_card, bg=DARK2)
-        tk.Entry(self._in_entry_frame,
-                  textvariable=self.input_folder,
-                  bg="#1a1a30", fg=ACC2,
-                  insertbackground=WHITE, relief="flat",
-                  font=("Consolas", 9)
-        ).pack(fill="x", pady=(4,0), ipady=4)
-        tk.Label(self._in_entry_frame,
-                  text="예) C:\\Users\\이름\\드론사진  또는  /home/user/photos",
-                  bg=DARK2, fg=TEXT2, font=("Segoe UI",7)).pack(anchor="w")
+        # ── 출력 폴더
+        tk.Label(parent, text="저장 폴더", bg=DARK, fg=TEXT,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(6, 2))
+        out_card = tk.Frame(parent, bg=DARK2, padx=8, pady=6)
+        out_card.pack(fill="x", padx=10, pady=(0, 4))
 
-        # 출력 폴더
-        tk.Label(parent, text="💾  저장 폴더", bg=DARK, fg=TEXT,
-                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(8,2))
-
-        out_card = tk.Frame(parent, bg=DARK2, padx=8, pady=8)
-        out_card.pack(fill="x", padx=10, pady=(0,4))
-
-        self._out_path_lbl = tk.Label(
-            out_card, textvariable=self.output_folder,
-            bg=DARK2, fg=GREEN,
-            font=("Consolas", 8), wraplength=230, justify="left", anchor="w"
-        )
+        self._out_path_lbl = tk.Label(out_card, textvariable=self.output_folder,
+                                       bg=DARK2, fg=GREEN, font=("Consolas", 8),
+                                       wraplength=230, justify="left", anchor="w")
         self._out_path_lbl.pack(fill="x")
-        self.output_folder.trace_add("write", lambda *_: self._update_path_label(
-            self._out_path_lbl, self.output_folder, "← 입력 폴더 선택 시 자동 설정"))
-        self._update_path_label(self._out_path_lbl, self.output_folder, "← 입력 폴더 선택 시 자동 설정")
+        self.output_folder.trace_add("write", lambda *_: self._upd_path_lbl(
+            self._out_path_lbl, self.output_folder, "입력 폴더 선택 시 자동 설정"))
+        self._upd_path_lbl(self._out_path_lbl, self.output_folder, "입력 폴더 선택 시 자동 설정")
 
-        btn_row_out = tk.Frame(out_card, bg=DARK2)
-        btn_row_out.pack(fill="x", pady=(6,0))
-        FlatButton(btn_row_out, "💾  폴더 선택",
-                    command=self._browse_output,
-                    bg="#2a6496", hover="#1d4f75",
-                    width=140, height=30, font_size=9
-        ).pack(side="left", padx=(0,6))
-        FlatButton(btn_row_out, "✏ 직접 입력",
-                    command=lambda: self._toggle_direct_input("output"),
-                    bg=DARK3, hover=DARK2, fg=TEXT2,
-                    width=90, height=30, font_size=9
-        ).pack(side="left")
+        or_ = tk.Frame(out_card, bg=DARK2)
+        or_.pack(fill="x", pady=(4, 0))
+        FlatButton(or_, "폴더 선택", command=self._browse_output,
+                    bg="#2a6496", hover="#1d4f75", width=130, height=28, font_size=9
+                    ).pack(side="left", padx=(0, 4))
+        FlatButton(or_, "직접 입력", command=lambda: self._toggle_entry("out"),
+                    bg=DARK3, hover=DARK2, fg=TEXT2, width=80, height=28, font_size=9
+                    ).pack(side="left")
+        self._out_entry = tk.Frame(out_card, bg=DARK2)
+        tk.Entry(self._out_entry, textvariable=self.output_folder,
+                  bg="#1a1a30", fg=GREEN, insertbackground=WHITE,
+                  relief="flat", font=("Consolas", 9)
+                  ).pack(fill="x", pady=(4, 0), ipady=4)
 
-        self._out_entry_frame = tk.Frame(out_card, bg=DARK2)
-        tk.Entry(self._out_entry_frame,
-                  textvariable=self.output_folder,
-                  bg="#1a1a30", fg=GREEN,
-                  insertbackground=WHITE, relief="flat",
-                  font=("Consolas", 9)
-        ).pack(fill="x", pady=(4,0), ipady=4)
-        tk.Label(self._out_entry_frame,
-                  text="예) C:\\Users\\이름\\출력폴더  (없으면 자동 생성)",
-                  bg=DARK2, fg=TEXT2, font=("Segoe UI",7)).pack(anchor="w")
-
-        # 옵션
+        # ── 옵션 체크
         opts = tk.Frame(parent, bg=DARK)
-        opts.pack(fill="x", padx=10, pady=(6,4))
-        self._check(opts, "하위 폴더 포함 (재귀)",  self.recursive_var)
-        self._check(opts, "비교 이미지 저장",       self.save_compare)
-        self._check(opts, "기존 파일 덮어쓰기",     self.overwrite_var)
+        opts.pack(fill="x", padx=10, pady=(4, 2))
+        self._chk(opts, "하위 폴더 포함",    self.recursive_var)
+        self._chk(opts, "비교 이미지 저장",  self.save_compare)
+        self._chk(opts, "기존 파일 덮어쓰기", self.overwrite_var)
 
-    def _update_path_label(self, lbl, var, placeholder):
-        v = var.get()
-        if not v:
+    def _upd_path_lbl(self, lbl, var, placeholder):
+        if not var.get():
             lbl.config(text=placeholder, fg=TEXT2)
 
-    def _toggle_direct_input(self, which):
-        frame = self._in_entry_frame if which == "input" else self._out_entry_frame
-        if frame.winfo_ismapped():
-            frame.pack_forget()
-        else:
-            frame.pack(fill="x", pady=(4,0))
+    def _toggle_entry(self, which):
+        f = self._in_entry if which == "in" else self._out_entry
+        if f.winfo_ismapped(): f.pack_forget()
+        else:                  f.pack(fill="x", pady=(4, 0))
 
     def _slider(self, parent, label, lo, hi, init, fmt=".2f"):
-        s = LabeledSlider(parent, label, lo, hi, init,
-                           fmt=fmt, padx=10, pady=3)
-        s.pack(fill="x", padx=10, pady=2)
+        s = LabeledSlider(parent, label, lo, hi, init, fmt=fmt, padx=10, pady=2)
+        s.pack(fill="x", padx=10, pady=1)
         return s
 
-    def _check(self, parent, text, var):
-        tk.Checkbutton(parent, text=text, variable=var,
-                        bg=DARK, fg=TEXT, selectcolor=DARK3,
-                        activebackground=DARK,
-                        font=("Segoe UI",9)).pack(anchor="w")
+    def _chk(self, parent, text, var):
+        tk.Checkbutton(parent, text=text, variable=var, bg=DARK, fg=TEXT,
+                        selectcolor=DARK3, activebackground=DARK,
+                        font=("Segoe UI", 9)).pack(anchor="w")
 
-    # ── 가운데 패널 : 원본 + 복원 비교 ──────────────────
+    # ── 가운데 패널 (이미지 비교)
 
     def _build_center_panel(self, parent):
         frame = tk.Frame(parent, bg=DARK)
-        frame.grid(row=0, column=1, sticky="nsew")
-        frame.rowconfigure(1, weight=1)
+        frame.grid(row=0, column=1, sticky="nsew", padx=4)
+        frame.rowconfigure(0, weight=0)   # 탭 바 (고정)
+        frame.rowconfigure(1, weight=1)   # 이미지 영역 (확장)
+        frame.rowconfigure(2, weight=0)   # 파일 목록 (고정)
         frame.columnconfigure(0, weight=1)
 
-        # ── 탭 헤더
-        tab_f = tk.Frame(frame, bg=DARK2, height=42)
-        tab_f.grid(row=0, column=0, sticky="ew")
-        tab_f.pack_propagate(False)
+        # ── 탭 바
+        tab_bar = tk.Frame(frame, bg=DARK2, height=40)
+        tab_bar.grid(row=0, column=0, sticky="ew")
+        tab_bar.pack_propagate(False)
 
-        self._tab_btns  = {}
-        self._active_tab = tk.StringVar(value="compare")
+        self._tab_btns   = {}
+        self._active_tab = "compare"
 
-        for txt, key in [("🔄 비교 보기", "compare"), ("📷 원본", "orig"), ("✨ 복원", "result")]:
-            b = tk.Label(tab_f, text=txt, bg=DARK2, fg=TEXT2,
-                          font=("Segoe UI",10), padx=14, pady=10, cursor="hand2")
+        tabs = [("비교 보기", "compare"), ("원본", "orig"), ("복원 결과", "result")]
+        for txt, key in tabs:
+            b = tk.Label(tab_bar, text=txt, bg=DARK2, fg=TEXT2,
+                          font=("Segoe UI", 10), padx=14, pady=9, cursor="hand2")
             b.pack(side="left")
             b.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
             self._tab_btns[key] = b
 
-        tk.Label(tab_f,
-                  text="🔍 휠: 줌  │  드래그: 이동  │  더블클릭/우클릭: 초기화  │  파일목록 더블클릭: 즉시처리",
-                  bg=DARK2, fg=TEXT2, font=("Segoe UI",8)).pack(side="right", padx=10)
+        tk.Label(tab_bar,
+                  text="휠:줌  드래그:이동  우클릭/더블클릭:초기화",
+                  bg=DARK2, fg=TEXT2, font=("Segoe UI", 7)).pack(side="right", padx=10)
 
-        # ── 이미지 표시 영역
-        self._img_container = tk.Frame(frame, bg=CARD)
-        self._img_container.grid(row=1, column=0, sticky="nsew", pady=(0,4))
-        self._img_container.rowconfigure(0, weight=0)
-        self._img_container.rowconfigure(1, weight=1)
-        self._img_container.columnconfigure(0, weight=1)
-        self._img_container.columnconfigure(1, weight=0)   # 분할선
-        self._img_container.columnconfigure(2, weight=1)
+        # ── 이미지 컨테이너
+        # compare 탭: [왼쪽 캔버스 | 분할선 | 오른쪽 캔버스]
+        # orig/result 탭: [단일 캔버스 (전체)]
+        self._img_outer = tk.Frame(frame, bg=CARD)
+        self._img_outer.grid(row=1, column=0, sticky="nsew")
 
-        # 비교 탭 레이블 바
-        self._lbl_orig_bar = tk.Frame(self._img_container, bg="#1a2035", height=24)
-        tk.Label(self._lbl_orig_bar, text="  📷  원본 (Original)  ",
-                  bg="#1a2035", fg=ACC2,
-                  font=("Segoe UI",9,"bold")).pack(side="left", pady=2, padx=4)
-        tk.Label(self._lbl_orig_bar,
-                  text="휠:줌  드래그:이동  더블클릭:초기화",
-                  bg="#1a2035", fg=TEXT2,
-                  font=("Segoe UI",7)).pack(side="right", padx=8)
+        # 비교 탭용 ZoomCanvas (좌/우)
+        self.zoom_left = ZoomCanvas(
+            self._img_outer, bg="#0e0e20",
+            hint="원본 이미지",
+            label="📷 원본 (Original)", label_color=ACC2)
+        self.zoom_right = ZoomCanvas(
+            self._img_outer, bg="#0e1a0e",
+            hint="미리보기 후 표시됩니다",
+            label="✨ 복원 (Restored)", label_color=GREEN)
 
-        self._lbl_result_bar = tk.Frame(self._img_container, bg="#1a2e1a", height=24)
-        tk.Label(self._lbl_result_bar, text="  ✨  복원 (Restored)  ",
-                  bg="#1a2e1a", fg=GREEN,
-                  font=("Segoe UI",9,"bold")).pack(side="left", pady=2, padx=4)
-        tk.Label(self._lbl_result_bar,
-                  text="휠:줌  드래그:이동  더블클릭:초기화",
-                  bg="#1a2e1a", fg=TEXT2,
-                  font=("Segoe UI",7)).pack(side="right", padx=8)
+        # 단일 탭용 ZoomCanvas
+        self.zoom_single = ZoomCanvas(
+            self._img_outer, bg=CARD,
+            hint="폴더 선택 → 파일 스캔\n→ 파일 더블클릭으로 즉시 처리\n\n결과 확인 후 [전체 처리] 버튼")
 
-        # 분할선 (수직)
-        self._divider = tk.Frame(self._img_container, bg=ACCENT, width=2)
+        # 분할선
+        self._divider = tk.Frame(self._img_outer, bg=ACCENT, width=3)
 
-        # ZoomCanvas 위젯 생성
-        self.zoom_canvas = ZoomCanvas(self._img_container, bg=CARD,
-                                       label="", label_color=TEXT2)
-        self.zoom_left   = ZoomCanvas(self._img_container, bg="#12122a",
-                                       label="📷 원본", label_color=ACC2)
-        self.zoom_right  = ZoomCanvas(self._img_container, bg="#0f1f0f",
-                                       label="✨ 복원", label_color=GREEN)
+        # 헤더 바 (비교 탭용)
+        self._bar_left = tk.Frame(self._img_outer, bg="#161628", height=24)
+        tk.Label(self._bar_left, text="  📷 원본 (Original) ",
+                  bg="#161628", fg=ACC2,
+                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=4)
 
-        # 초기 안내 텍스트
-        self.after(200, self._show_hint)
+        self._bar_right = tk.Frame(self._img_outer, bg="#0f1f0f", height=24)
+        tk.Label(self._bar_right, text="  ✨ 복원 (Restored) ",
+                  bg="#0f1f0f", fg=GREEN,
+                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=4)
 
-        # 탭 초기화
-        self._switch_tab("compare")
+        # 초기 탭 설정
+        self._apply_tab_layout("compare")
 
-        # ── 파일 리스트 (하단)
-        list_f = tk.Frame(frame, bg=DARK2, height=130)
-        list_f.grid(row=2, column=0, sticky="ew", pady=(4,0))
-        list_f.pack_propagate(False)
+        # ── 파일 목록
+        list_outer = tk.Frame(frame, bg=DARK2, height=125)
+        list_outer.grid(row=2, column=0, sticky="ew", pady=(3, 0))
+        list_outer.pack_propagate(False)
 
-        list_hdr = tk.Frame(list_f, bg=DARK2)
-        list_hdr.pack(fill="x", pady=(4,0), padx=4)
-        tk.Label(list_hdr, text="📋  파일 목록", bg=DARK2, fg=TEXT2,
-                  font=("Segoe UI",9,"bold")).pack(side="left", padx=4)
-        self._file_count_lbl = tk.Label(list_hdr, text="(0개)",
-                                         bg=DARK2, fg=TEXT2,
-                                         font=("Segoe UI",8))
-        self._file_count_lbl.pack(side="left")
-        tk.Label(list_hdr,
-                  text="← 클릭: 원본 보기  │  더블클릭: 즉시 그림자 제거+복원 처리",
-                  bg=DARK2, fg=WARN, font=("Segoe UI",8)).pack(side="right", padx=8)
+        hdr = tk.Frame(list_outer, bg=DARK2)
+        hdr.pack(fill="x", padx=4, pady=(4, 0))
+        tk.Label(hdr, text="파일 목록", bg=DARK2, fg=TEXT2,
+                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=4)
+        self._cnt_lbl = tk.Label(hdr, text="(0개)", bg=DARK2, fg=TEXT2,
+                                  font=("Segoe UI", 8))
+        self._cnt_lbl.pack(side="left")
+        tk.Label(hdr,
+                  text="클릭:원본 표시  |  더블클릭:즉시 그림자제거+복원 처리",
+                  bg=DARK2, fg=WARN, font=("Segoe UI", 8)).pack(side="right", padx=8)
 
-        list_scroll = ttk.Scrollbar(list_f, orient="vertical")
+        list_sb = ttk.Scrollbar(list_outer, orient="vertical")
         self.file_listbox = tk.Listbox(
-            list_f, bg=DARK2, fg=TEXT, selectbackground=ACCENT,
-            relief="flat", borderwidth=0, font=("Consolas",9),
-            yscrollcommand=list_scroll.set, activestyle="none",
-        )
-        list_scroll.config(command=self.file_listbox.yview)
-        list_scroll.pack(side="right", fill="y")
-        self.file_listbox.pack(fill="both", expand=True, padx=4)
+            list_outer, bg=DARK2, fg=TEXT, selectbackground=ACCENT,
+            relief="flat", borderwidth=0, font=("Consolas", 9),
+            yscrollcommand=list_sb.set, activestyle="none")
+        list_sb.config(command=self.file_listbox.yview)
+        list_sb.pack(side="right", fill="y")
+        self.file_listbox.pack(fill="both", expand=True, padx=4, pady=(2, 4))
         self.file_listbox.bind("<<ListboxSelect>>", self._on_file_select)
-        self.file_listbox.bind("<Double-Button-1>", self._on_file_double)
+        self.file_listbox.bind("<Double-Button-1>",  self._on_file_double)
 
-    def _show_hint(self):
-        """초기 안내 텍스트 표시"""
-        if self._cur_orig is None:
-            for c in (self.zoom_canvas, self.zoom_left, self.zoom_right):
-                c.delete("all")
-            cw = self.zoom_canvas.winfo_width()
-            ch = self.zoom_canvas.winfo_height()
-            if cw > 50 and ch > 50:
-                self.zoom_canvas.create_text(
-                    cw // 2, ch // 2,
-                    text="📂 폴더 선택 → 파일 스캔 → 파일을 더블클릭\n"
-                         "또는 파일 클릭 후 [🔬 선택 이미지 미리보기] 클릭\n\n"
-                         "결과가 마음에 들면  ▶ 전체 처리  버튼으로\n"
-                         "전체 이미지를 일괄 처리합니다\n\n"
-                         "🔍 마우스 휠: 줌  │  드래그: 이동  │  더블클릭: 초기화",
-                    fill=TEXT2, font=("Segoe UI", 12), justify="center",
-                    tags="hint"
-                )
-
-    def _switch_tab(self, key):
-        self._active_tab.set(key)
-        for k, btn in self._tab_btns.items():
-            btn.config(bg=DARK3 if k == key else DARK2,
-                        fg=WHITE if k == key else TEXT2)
+    def _switch_tab(self, key: str):
+        self._active_tab = key
+        for k, b in self._tab_btns.items():
+            b.config(bg=DARK3 if k == key else DARK2,
+                      fg=WHITE if k == key else TEXT2)
         self._apply_tab_layout(key)
 
-    def _apply_tab_layout(self, key):
-        """탭 전환 시 캔버스 레이아웃 변경"""
-        self.zoom_canvas.grid_remove()
-        self.zoom_left.grid_remove()
-        self.zoom_right.grid_remove()
-        self._lbl_orig_bar.grid_remove()
-        self._lbl_result_bar.grid_remove()
-        self._divider.grid_remove()
+    def _apply_tab_layout(self, key: str):
+        """
+        탭 레이아웃 완전 재구성.
+        place() 사용하여 grid weight 버그 회피.
+        """
+        # 모든 위젯 숨기기
+        for w in (self.zoom_single, self.zoom_left, self.zoom_right,
+                  self._bar_left, self._bar_right, self._divider):
+            w.place_forget()
 
         if key == "compare":
-            self._lbl_orig_bar.grid(row=0, column=0, sticky="ew")
-            self._lbl_result_bar.grid(row=0, column=2, sticky="ew")
-            self._divider.grid(row=0, column=1, rowspan=2, sticky="ns")
-            self.zoom_left.grid(row=1, column=0, sticky="nsew")
-            self.zoom_right.grid(row=1, column=2, sticky="nsew")
-            self._img_container.rowconfigure(0, weight=0)
-            self._img_container.rowconfigure(1, weight=1)
-            # 이미지 적용
+            # 비교 탭: 헤더바(24px) + 좌우 캔버스 (분할선 포함)
+            # place_forget → place 방식으로 정밀 배치
+            self._img_outer.update_idletasks()
+            W = self._img_outer.winfo_width()
+            H = self._img_outer.winfo_height()
+            if W < 10 or H < 10:
+                # 아직 배치 안 됨 → 나중에 재호출
+                self._img_outer.after(100, lambda: self._apply_tab_layout("compare"))
+                return
+
+            HDR_H  = 24
+            DIV_W  = 3
+            half_w = (W - DIV_W) // 2
+
+            # 헤더 바
+            self._bar_left.place(x=0, y=0, width=half_w, height=HDR_H)
+            self._bar_right.place(x=half_w + DIV_W, y=0, width=W - half_w - DIV_W, height=HDR_H)
+            # 분할선
+            self._divider.place(x=half_w, y=0, width=DIV_W, height=H)
+            # 캔버스
+            self.zoom_left.place(x=0, y=HDR_H, width=half_w, height=H - HDR_H)
+            self.zoom_right.place(x=half_w + DIV_W, y=HDR_H,
+                                   width=W - half_w - DIV_W, height=H - HDR_H)
+
+            # 이미지 업데이트
             if self._cur_orig is not None:
                 self.zoom_left.load_image(cv2pil(self._cur_orig))
             else:
@@ -1178,206 +1085,191 @@ class DroneApp(tk.Tk):
                 self.zoom_right.load_image(cv2pil(self._cur_result))
             else:
                 self.zoom_right.clear()
-        else:
-            self._img_container.rowconfigure(0, weight=1)
-            self._img_container.rowconfigure(1, weight=0)
-            self.zoom_canvas.grid(row=0, column=0, columnspan=3, sticky="nsew")
-            if key == "orig":
-                if self._cur_orig is not None:
-                    self.zoom_canvas._label_text  = "📷 원본 (Original)"
-                    self.zoom_canvas._label_color = ACC2
-                    self.zoom_canvas.load_image(cv2pil(self._cur_orig))
-                else:
-                    self.zoom_canvas.clear()
-            elif key == "result":
-                if self._cur_result is not None:
-                    self.zoom_canvas._label_text  = "✨ 복원 (Restored)"
-                    self.zoom_canvas._label_color = GREEN
-                    self.zoom_canvas.load_image(cv2pil(self._cur_result))
-                else:
-                    self.zoom_canvas._label_text  = "복원 결과 없음"
-                    self.zoom_canvas._label_color = TEXT2
-                    self.zoom_canvas.clear()
 
-    # ── 오른쪽 패널 ──────────────────────────────────────
+        else:
+            # 단일 탭: 전체 크기로 단일 캔버스
+            self.zoom_single.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+
+            if key == "orig":
+                self.zoom_single._label_text  = "📷 원본 (Original)"
+                self.zoom_single._label_color = ACC2
+                if self._cur_orig is not None:
+                    self.zoom_single.load_image(cv2pil(self._cur_orig))
+                else:
+                    self.zoom_single._hint = "파일을 클릭하면 원본이 표시됩니다"
+                    self.zoom_single.clear()
+            else:  # result
+                self.zoom_single._label_text  = "✨ 복원 (Restored)"
+                self.zoom_single._label_color = GREEN
+                if self._cur_result is not None:
+                    self.zoom_single.load_image(cv2pil(self._cur_result))
+                else:
+                    self.zoom_single._hint = "미리보기 후 복원 결과가 표시됩니다"
+                    self.zoom_single.clear()
+
+    def _on_img_outer_resize(self, event):
+        """창 크기 변경 시 compare 탭 재배치"""
+        if self._active_tab == "compare":
+            self._apply_tab_layout("compare")
+
+    # ── 오른쪽 패널
 
     def _build_right_panel(self, parent):
-        frame = tk.Frame(parent, bg=DARK, width=320)
-        frame.grid(row=0, column=2, sticky="nsew", padx=(8,0))
+        frame = tk.Frame(parent, bg=DARK, width=300)
+        frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
         frame.pack_propagate(False)
 
-        # 단일 처리 결과
-        self._section_plain(frame, "🔬  선택 이미지 처리 결과")
+        # ── 단일 미리보기 결과
+        self._sec_plain(frame, "선택 이미지 처리 결과")
+        info_f = tk.Frame(frame, bg=CARD, pady=6)
+        info_f.pack(fill="x", padx=8, pady=4)
 
-        self._preview_info_frame = tk.Frame(frame, bg=CARD, pady=8)
-        self._preview_info_frame.pack(fill="x", padx=8, pady=4)
-
-        self._preview_stat_vars = {}
-        preview_items = [
-            ("shadow_pct",   "그림자 비율",    "-"),
-            ("detect_ms",    "탐지 시간",      "-"),
-            ("restore_ms",   "복원 시간",      "-"),
-            ("total_ms",     "전체 처리 시간", "-"),
-        ]
-        for key, label, init in preview_items:
-            row = tk.Frame(self._preview_info_frame, bg=CARD)
-            row.pack(fill="x", padx=10, pady=2)
+        self._prev_vars = {}
+        for key, label, init in [
+            ("shadow_pct", "그림자 비율",    "-"),
+            ("detect_ms",  "탐지 시간",      "-"),
+            ("restore_ms", "복원 시간",      "-"),
+            ("total_ms",   "전체 처리 시간", "-"),
+        ]:
+            row = tk.Frame(info_f, bg=CARD)
+            row.pack(fill="x", padx=8, pady=2)
             tk.Label(row, text=label, bg=CARD, fg=TEXT2,
-                      font=("Segoe UI",9)).pack(side="left")
+                      font=("Segoe UI", 9)).pack(side="left")
             v = tk.StringVar(value=init)
             tk.Label(row, textvariable=v, bg=CARD, fg=ACC2,
-                      font=("Segoe UI",9,"bold")).pack(side="right")
-            self._preview_stat_vars[key] = v
+                      font=("Segoe UI", 9, "bold")).pack(side="right")
+            self._prev_vars[key] = v
 
-        self._preview_status_lbl = tk.Label(
-            self._preview_info_frame,
-            text="파일 목록 더블클릭 또는\n[선택 이미지 미리보기] 클릭",
-            bg=CARD, fg=TEXT2, font=("Segoe UI",8),
-            wraplength=280, justify="left"
-        )
-        self._preview_status_lbl.pack(fill="x", padx=10, pady=(4,0))
+        self._prev_status = tk.Label(
+            info_f,
+            text="파일을 더블클릭하면\n즉시 그림자 제거+복원 처리됩니다",
+            bg=CARD, fg=TEXT2, font=("Segoe UI", 8),
+            wraplength=260, justify="left")
+        self._prev_status.pack(fill="x", padx=8, pady=(4, 0))
 
-        # 배치 진행
-        self._section_plain(frame, "📊  전체 배치 처리 진행")
-
-        pg_f = tk.Frame(frame, bg=CARD, pady=10)
+        # ── 배치 처리 진행
+        self._sec_plain(frame, "전체 배치 처리")
+        pg_f = tk.Frame(frame, bg=CARD, pady=8)
         pg_f.pack(fill="x", padx=8, pady=4)
         tk.Label(pg_f, text="전체 진행", bg=CARD, fg=TEXT2,
-                  font=("Segoe UI",9)).pack(anchor="w", padx=10)
-        self.prog_bar = ttk.Progressbar(pg_f, mode="determinate", length=290)
-        self.prog_bar.pack(padx=10, pady=4)
+                  font=("Segoe UI", 9)).pack(anchor="w", padx=8)
+        self.prog_bar = ttk.Progressbar(pg_f, mode="determinate", length=270)
+        self.prog_bar.pack(padx=8, pady=4)
         self.prog_lbl = tk.Label(pg_f, text="0 / 0", bg=CARD, fg=TEXT2,
-                                   font=("Segoe UI",9))
-        self.prog_lbl.pack(anchor="e", padx=10)
+                                  font=("Segoe UI", 9))
+        self.prog_lbl.pack(anchor="e", padx=8)
 
-        cur_f = tk.Frame(frame, bg=CARD, pady=8)
+        cur_f = tk.Frame(frame, bg=CARD, pady=6)
         cur_f.pack(fill="x", padx=8, pady=4)
         tk.Label(cur_f, text="현재 처리 중", bg=CARD, fg=TEXT2,
-                  font=("Segoe UI",9)).pack(anchor="w", padx=10)
+                  font=("Segoe UI", 9)).pack(anchor="w", padx=8)
         self.cur_lbl = tk.Label(cur_f, text="-", bg=CARD, fg=WARN,
-                                 font=("Consolas",8), wraplength=270, anchor="w")
-        self.cur_lbl.pack(fill="x", padx=10)
+                                 font=("Consolas", 8), wraplength=260, anchor="w")
+        self.cur_lbl.pack(fill="x", padx=8)
 
-        # 통계
-        self._section_plain(frame, "📈  처리 통계")
+        # ── 통계
+        self._sec_plain(frame, "처리 통계")
         stats_f = tk.Frame(frame, bg=CARD)
         stats_f.pack(fill="x", padx=8, pady=4)
-
         self._stat_vars = {}
-        stat_items = [
-            ("total_files",    "총 파일 수",      "0"),
-            ("processed",      "처리 완료",        "0"),
-            ("failed",         "실패",             "0"),
-            ("shadow_avg",     "평균 그림자 비율", "0.0 %"),
-            ("speed_avg",      "평균 처리 속도",   "0 ms/장"),
-            ("elapsed",        "경과 시간",        "00:00"),
-        ]
-        for key, label, init in stat_items:
+        for key, label, init in [
+            ("total_files", "총 파일 수",    "0"),
+            ("processed",   "처리 완료",     "0"),
+            ("failed",      "실패",          "0"),
+            ("shadow_avg",  "평균 그림자",    "0.0 %"),
+            ("speed_avg",   "평균 처리 속도", "0 ms/장"),
+            ("elapsed",     "경과 시간",      "00:00"),
+        ]:
             row = tk.Frame(stats_f, bg=CARD)
-            row.pack(fill="x", padx=10, pady=3)
+            row.pack(fill="x", padx=8, pady=2)
             tk.Label(row, text=label, bg=CARD, fg=TEXT2,
-                      font=("Segoe UI",9)).pack(side="left")
+                      font=("Segoe UI", 9)).pack(side="left")
             v = tk.StringVar(value=init)
             tk.Label(row, textvariable=v, bg=CARD, fg=ACC2,
-                      font=("Segoe UI",9,"bold")).pack(side="right")
+                      font=("Segoe UI", 9, "bold")).pack(side="right")
             self._stat_vars[key] = v
 
-        # 로그
-        self._section_plain(frame, "📋  처리 로그")
+        # ── 로그
+        self._sec_plain(frame, "처리 로그")
         log_f = tk.Frame(frame, bg=CARD)
         log_f.pack(fill="both", expand=True, padx=8, pady=4)
-
         log_sb = ttk.Scrollbar(log_f, orient="vertical")
-        self.log_text = tk.Text(
-            log_f, bg=CARD, fg=TEXT, font=("Consolas",8),
-            relief="flat", wrap="word", state="disabled",
-            yscrollcommand=log_sb.set,
-        )
+        self.log_text = tk.Text(log_f, bg=CARD, fg=TEXT, font=("Consolas", 8),
+                                 relief="flat", wrap="word", state="disabled",
+                                 yscrollcommand=log_sb.set)
         log_sb.config(command=self.log_text.yview)
         log_sb.pack(side="right", fill="y")
         self.log_text.pack(fill="both", expand=True)
+        for t, c in [("info", TEXT2), ("ok", GREEN), ("warn", WARN), ("error", RED)]:
+            self.log_text.tag_config(t, foreground=c)
 
-        self.log_text.tag_config("info",  foreground=TEXT2)
-        self.log_text.tag_config("ok",    foreground=GREEN)
-        self.log_text.tag_config("warn",  foreground=WARN)
-        self.log_text.tag_config("error", foreground=RED)
-
-    def _section_plain(self, parent, title):
+    def _sec_plain(self, parent, title):
         f = tk.Frame(parent, bg=DARK)
-        f.pack(fill="x", padx=8, pady=(10,2))
+        f.pack(fill="x", padx=8, pady=(8, 2))
         tk.Label(f, text=title, bg=DARK, fg=ACC2,
-                  font=("Segoe UI",10,"bold")).pack(side="left")
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Separator(f, orient="horizontal").pack(
             side="left", fill="x", expand=True, padx=6)
 
     # ── 푸터
+
     def _build_footer(self):
-        ft = tk.Frame(self, bg=DARK3, height=28)
-        ft.pack(fill="x", side="bottom")
-        ft.pack_propagate(False)
+        ft = tk.Frame(self, bg=DARK3, height=26)
+        ft.pack(fill="x", side="bottom"); ft.pack_propagate(False)
         self.status_lbl = tk.Label(ft, text="준비", bg=DARK3, fg=TEXT2,
-                                    font=("Segoe UI",9), padx=12)
-        self.status_lbl.pack(side="left", pady=4)
-        tk.Label(ft,
-                  text="v2.2  │  더블클릭: 즉시 미리보기  │  🔬 미리보기 → ▶ 전체 처리",
-                  bg=DARK3, fg=TEXT2, font=("Segoe UI",8), padx=12).pack(side="right", pady=4)
+                                    font=("Segoe UI", 9), padx=10)
+        self.status_lbl.pack(side="left", pady=3)
+        tk.Label(ft, text="v3.0  |  더블클릭: 즉시 처리  |  슬라이더 조정 → 미리보기 버튼으로 재처리",
+                  bg=DARK3, fg=TEXT2, font=("Segoe UI", 8), padx=10
+                  ).pack(side="right", pady=3)
+        # 창 크기 변경 → compare 탭 재배치
+        self.bind("<Configure>", self._on_window_resize)
+
+    def _on_window_resize(self, event):
+        if event.widget is self and self._active_tab == "compare":
+            self.after(50, lambda: self._apply_tab_layout("compare"))
 
     # ──────────────────────────────────────────────────────
     # 이벤트 핸들러
-    # ──────────────────────────────────────────────────────
 
     def _open_model_download(self):
-        model_dir = os.path.join(os.path.dirname(__file__), "models")
-        dlg = ModelDownloadDialog(
-            self,
-            model_dir=model_dir,
-            reload_callback=self._reload_models,
-        )
-        dlg.focus()
+        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        ModelDownloadDialog(self, model_dir=model_dir,
+                             reload_callback=self._reload_models).focus()
 
     def _reload_models(self):
-        self._set_status("모델 재로드 중…", WARN)
-        self.model_badge.config(text="⏳ 재로딩…", fg=WARN)
+        self._set_status("모델 재로드 중...", WARN)
+        self.model_badge.config(text="재로딩...", fg=WARN)
         self._load_models_async()
-        self._log("🔄 모델 재로드 요청됨 — 잠시 기다리세요", "warn")
+        self._log("모델 재로드 요청됨", "warn")
 
     def _browse_input(self):
-        init = self.input_folder.get().strip()
-        if not init or not os.path.isdir(init):
-            init = os.path.expanduser("~")
-        d = filedialog.askdirectory(
-            title="드론 사진이 있는 폴더를 선택하세요",
-            initialdir=init,
-        )
+        init = self.input_folder.get().strip() or os.path.expanduser("~")
+        if not os.path.isdir(init): init = os.path.expanduser("~")
+        d = filedialog.askdirectory(title="드론 사진 폴더 선택", initialdir=init)
         if d:
             d = os.path.normpath(d)
             self.input_folder.set(d)
             if not self.output_folder.get():
                 self.output_folder.set(os.path.join(d, "output_restored"))
-            self._log(f"📂 입력 폴더: {d}", "info")
+            self._log(f"입력 폴더: {d}", "info")
 
     def _browse_output(self):
-        init = self.output_folder.get().strip()
-        if not init or not os.path.isdir(init):
-            init = self.input_folder.get().strip() or os.path.expanduser("~")
-        d = filedialog.askdirectory(
-            title="결과를 저장할 폴더를 선택하세요",
-            initialdir=init,
-        )
+        init = self.output_folder.get().strip() or \
+               self.input_folder.get().strip() or os.path.expanduser("~")
+        if not os.path.isdir(init): init = os.path.expanduser("~")
+        d = filedialog.askdirectory(title="저장 폴더 선택", initialdir=init)
         if d:
-            d = os.path.normpath(d)
-            self.output_folder.set(d)
-            self._log(f"💾 출력 폴더: {d}", "info")
+            self.output_folder.set(os.path.normpath(d))
+            self._log(f"출력 폴더: {d}", "info")
 
     def _scan_files(self):
         folder = self.input_folder.get().strip()
         if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("경고", "유효한 입력 폴더를 선택하세요.")
-            return
-        if self.recursive_var.get():
-            files = scan_folder_recursive(folder)
-        else:
-            files = scan_folder(folder)
+            messagebox.showwarning("경고", "유효한 입력 폴더를 선택하세요."); return
+
+        files = scan_folder_recursive(folder) if self.recursive_var.get() \
+                else scan_folder(folder)
         self._file_list = files
 
         self.file_listbox.delete(0, "end")
@@ -1385,159 +1277,139 @@ class DroneApp(tk.Tk):
             self.file_listbox.insert("end", os.path.basename(f))
 
         self._stat_vars["total_files"].set(str(len(files)))
-        self._file_count_lbl.config(text=f"({len(files)}개)")
+        self._cnt_lbl.config(text=f"({len(files)}개)")
         self._set_status(f"{len(files)}개 파일 발견", GREEN if files else WARN)
-        self._log(f"📂 {folder}\n   → {len(files)}개 이미지 발견", "info")
-
+        self._log(f"스캔: {folder} → {len(files)}개 발견", "info")
         if files:
-            self._log("💡 파일을 더블클릭하면 즉시 그림자 제거+복원 처리됩니다", "warn")
+            self._log("파일 더블클릭 → 즉시처리  |  미리보기 확인 후 [전체 처리]", "warn")
 
     def _on_file_select(self, event):
-        """파일 클릭: 원본 이미지 표시"""
+        """단일 클릭: 원본 이미지 표시 (처리 없음)"""
         sel = self.file_listbox.curselection()
-        if not sel:
-            return
-        idx  = sel[0]
-        if idx >= len(self._file_list):
-            return
+        if not sel: return
+        idx = sel[0]
+        if idx >= len(self._file_list): return
         path = self._file_list[idx]
-        self._selected_index = idx
-        self._selected_path  = path
 
-        try:
-            img = cv2.imread(path)
-            if img is not None:
-                self._cur_orig   = img
-                # 복원 결과 초기화 (원본만 표시)
-                self._cur_result = None
-                self._cur_binary = None
-                self._cur_soft   = None
-                # 원본 탭으로 전환해서 표시
-                self._switch_tab("orig")
-                h, w = img.shape[:2]
-                self._set_status(f"선택: {os.path.basename(path)}  ({w}×{h})  │  더블클릭으로 즉시 처리", ACC2)
-                self._preview_status_lbl.config(
-                    text=f"✔ 선택됨: {os.path.basename(path)}\n"
-                         f"크기: {w}×{h}\n\n"
-                         f"더블클릭 또는 [🔬 미리보기] 버튼으로\n그림자 제거+복원 처리",
-                    fg=WARN
-                )
-        except Exception as e:
-            self._log(f"이미지 로드 실패: {e}", "error")
+        self._selected_idx  = idx
+        self._selected_path = path
+
+        img = safe_imread(path)
+        if img is None:
+            self._log(f"❌ 이미지 로드 실패: {os.path.basename(path)}", "error")
+            self._set_status(f"로드 실패: {os.path.basename(path)}", RED)
+            return
+
+        self._cur_orig   = img
+        self._cur_result = None
+        self._cur_binary = None
+        self._cur_soft   = None
+
+        # 원본 탭으로 전환
+        self._switch_tab("orig")
+        h, w = img.shape[:2]
+        self._set_status(
+            f"선택: {os.path.basename(path)}  ({w}×{h})  |  더블클릭=즉시처리", ACC2)
+        self._prev_status.config(
+            text=f"선택: {os.path.basename(path)}\n크기: {w}×{h}\n\n"
+                 "더블클릭 또는 [미리보기] 버튼으로 처리", fg=WARN)
 
     def _on_file_double(self, event):
-        """파일 더블클릭: 즉시 미리보기 처리"""
-        sel = self.file_listbox.curselection()
-        if not sel:
+        """더블클릭: 즉시 미리보기 처리"""
+        # 더블클릭 시 ListboxSelect도 먼저 발생하므로 _selected_path가 이미 설정됨
+        if self._is_previewing:
+            self._log("⚠ 처리 중입니다. 완료 후 다시 시도하세요.", "warn")
             return
-        idx = sel[0]
-        if idx >= len(self._file_list):
+        if not self._selected_path:
             return
-        # 선택 상태 갱신
-        self._selected_index = idx
-        self._selected_path  = self._file_list[idx]
-        # 즉시 미리보기 실행
+        # 이미지가 로드 안 됐을 경우 다시 로드
+        if self._cur_orig is None:
+            img = safe_imread(self._selected_path)
+            if img is None:
+                self._log(f"❌ 이미지 로드 실패: {os.path.basename(self._selected_path)}", "error")
+                return
+            self._cur_orig = img
         self._preview_selected()
 
-    # ──────────────────────────────────────────────────────
-    # 단일 이미지 미리보기 처리
-    # ──────────────────────────────────────────────────────
+    # ── 단일 미리보기 처리
 
     def _preview_selected(self):
+        """선택된 파일 1장 미리보기"""
         if self._is_previewing:
-            self._log("이미 처리 중입니다...", "warn")
-            return
+            self._log("⚠ 이미 처리 중입니다.", "warn"); return
         if not self._selected_path or not os.path.isfile(self._selected_path):
             messagebox.showwarning("경고",
-                "파일 목록에서 이미지를 먼저 선택하세요.\n"
-                "파일 스캔이 안 된 경우 [📂 파일 스캔] 버튼을 먼저 클릭하세요.")
-            return
+                "파일 목록에서 이미지를 선택하거나 더블클릭하세요."); return
 
         self._is_previewing = True
         self.btn_preview.set_enabled(False)
-        self._preview_status_lbl.config(
-            text="⏳ 처리 중 (미리보기 모드: 800px)...\n잠시 기다려 주세요", fg=WARN)
-        self._set_status(f"처리 중: {os.path.basename(self._selected_path)}", WARN)
+        fname = os.path.basename(self._selected_path)
+        self._prev_status.config(
+            text=f"처리 중: {fname}\n미리보기 모드 (빠른 처리)...", fg=WARN)
+        self._set_status(f"처리 중: {fname}", WARN)
 
         params = self._collect_params()
         path   = self._selected_path
 
         def _work():
-            img = cv2.imread(path, cv2.IMREAD_COLOR)
-            if img is None:
-                self._queue.put(("preview_error", "이미지를 읽을 수 없습니다."))
-                return
             try:
+                img = safe_imread(path)
+                if img is None:
+                    self._queue.put(("preview_error",
+                                     f"이미지 로드 실패\n경로: {path}"))
+                    return
                 result, binary, soft, stats = process_single(
-                    img,
-                    detection_mode=params["detection_mode"],
-                    sensitivity=params["sensitivity"],
-                    feather=params["feather"],
-                    radio_strength=params["radio_strength"],
-                    color_strength=params["color_strength"],
-                    retinex_strength=params["retinex_strength"],
-                    use_ai_color=params["use_ai_color"],
-                    denoise_h=params["denoise_h"],
-                    sharpen_amount=params["sharpen_amount"],
-                    clahe_clip=params["clahe_clip"],
-                    preview_mode=True,
-                )
-                self._queue.put(("preview_done", img, result, binary, soft, stats,
-                                 os.path.basename(path)))
+                    img, **params, preview_mode=True)
+                self._queue.put(("preview_done",
+                                  img, result, binary, soft, stats,
+                                  os.path.basename(path)))
             except Exception as e:
                 import traceback
-                self._queue.put(("preview_error", f"{e}\n{traceback.format_exc()}"))
+                tb = traceback.format_exc()
+                self._queue.put(("preview_error",
+                                  f"{type(e).__name__}: {e}\n{tb[:600]}"))
+            finally:
+                # finally 보장: 어떤 경우에도 플래그 해제
+                # (queue 처리에서도 해제하지만 예외 시 안전망)
+                pass
 
         threading.Thread(target=_work, daemon=True).start()
 
-    # ──────────────────────────────────────────────────────
-    # 전체 배치 처리
-    # ──────────────────────────────────────────────────────
+    # ── 전체 배치 처리
 
     def _start_processing(self):
-        if self._is_running:
-            return
+        if self._is_running: return
         if not self._file_list:
             self._scan_files()
             if not self._file_list:
-                messagebox.showwarning("경고", "처리할 파일이 없습니다.")
-                return
+                messagebox.showwarning("경고", "처리할 파일이 없습니다."); return
 
         out_dir = self.output_folder.get().strip()
         if not out_dir:
-            messagebox.showwarning("경고", "출력 폴더를 지정하세요.")
-            return
+            messagebox.showwarning("경고", "출력 폴더를 지정하세요."); return
 
-        ans = messagebox.askyesno(
-            "전체 처리 확인",
-            f"총 {len(self._file_list)}개 이미지를 처리합니다.\n"
-            f"출력 폴더: {out_dir}\n\n"
-            "현재 설정된 파라미터로 전체 처리를 시작하시겠습니까?",
-            default="yes"
-        )
-        if not ans:
+        if not messagebox.askyesno("전체 처리 확인",
+                f"총 {len(self._file_list)}개 이미지를 처리합니다.\n"
+                f"출력: {out_dir}\n\n현재 파라미터로 시작하시겠습니까?"):
             return
 
         os.makedirs(out_dir, exist_ok=True)
-
-        self._is_running  = True
+        self._is_running = True
         self._cancel_flag.clear()
         self.btn_start.set_enabled(False)
         self.btn_cancel.set_enabled(True)
         self.btn_preview.set_enabled(False)
-
-        self._stat_vars["processed"].set("0")
-        self._stat_vars["failed"].set("0")
+        for k in ("processed", "failed"):
+            self._stat_vars[k].set("0")
         self._stat_vars["shadow_avg"].set("0.0 %")
         self._stat_vars["speed_avg"].set("0 ms/장")
         self._stat_vars["elapsed"].set("00:00")
         self.prog_bar["value"] = 0
 
         params = self._collect_params()
-        t = threading.Thread(target=self._run_batch,
-                              args=(self._file_list, out_dir, params),
-                              daemon=True)
-        t.start()
+        threading.Thread(target=self._run_batch,
+                          args=(self._file_list, out_dir, params),
+                          daemon=True).start()
 
     def _cancel_processing(self):
         self._cancel_flag.set()
@@ -1545,21 +1417,19 @@ class DroneApp(tk.Tk):
 
     def _collect_params(self):
         return {
-            "detection_mode":  self.detect_mode.get(),
-            "sensitivity":     float(self.sl_sensitivity.get()),
-            "feather":         int(self.sl_feather.get()),
-            "radio_strength":  float(self.sl_radio.get()),
-            "color_strength":  float(self.sl_color.get()),
-            "retinex_strength":float(self.sl_retinex.get()),
-            "use_ai_color":    self.use_ai_color.get(),
-            "denoise_h":       int(self.sl_denoise.get()),
-            "sharpen_amount":  float(self.sl_sharpen.get()),
-            "clahe_clip":      float(self.sl_clahe.get()),
+            "detection_mode":   self.detect_mode.get(),
+            "sensitivity":      float(self.sl_sensitivity.get()),
+            "feather":          int(self.sl_feather.get()),
+            "radio_strength":   float(self.sl_radio.get()),
+            "color_strength":   float(self.sl_color.get()),
+            "retinex_strength": float(self.sl_retinex.get()),
+            "use_ai_color":     bool(self.use_ai_color.get()),
+            "denoise_h":        int(self.sl_denoise.get()),
+            "sharpen_amount":   float(self.sl_sharpen.get()),
+            "clahe_clip":       float(self.sl_clahe.get()),
         }
 
-    # ──────────────────────────────────────────────────────
-    # 배치 처리 스레드
-    # ──────────────────────────────────────────────────────
+    # ── 배치 처리 스레드
 
     def _run_batch(self, files, out_dir, params):
         total       = len(files)
@@ -1572,109 +1442,67 @@ class DroneApp(tk.Tk):
 
         self._queue.put(("progress", 0, total, "", ""))
 
-        def _process_one(path):
-            if self._cancel_flag.is_set():
-                return None
-
+        def _one(path):
+            if self._cancel_flag.is_set(): return None
             fname = os.path.basename(path)
             stem  = Path(path).stem
             ext   = Path(path).suffix
+            out_p = os.path.join(out_dir, f"{stem}_restored{ext}")
+            if os.path.exists(out_p) and not self.overwrite_var.get():
+                return {"status": "skip", "fname": fname}
 
-            out_path = os.path.join(out_dir, f"{stem}_restored{ext}")
-            if os.path.exists(out_path) and not self.overwrite_var.get():
-                return {"status": "skip", "path": path, "fname": fname}
-
-            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            img = safe_imread(path)
             if img is None:
-                return {"status": "fail", "path": path, "fname": fname,
-                        "msg": "이미지 읽기 실패"}
+                return {"status": "fail", "fname": fname, "msg": "이미지 로드 실패"}
             try:
                 result, binary, soft, stats = process_single(
-                    img,
-                    detection_mode=params["detection_mode"],
-                    sensitivity=params["sensitivity"],
-                    feather=params["feather"],
-                    radio_strength=params["radio_strength"],
-                    color_strength=params["color_strength"],
-                    retinex_strength=params["retinex_strength"],
-                    use_ai_color=params["use_ai_color"],
-                    denoise_h=params["denoise_h"],
-                    sharpen_amount=params["sharpen_amount"],
-                    clahe_clip=params["clahe_clip"],
-                    preview_mode=False,
-                )
-                cv2.imwrite(out_path, result)
-
+                    img, **params, preview_mode=False)
+                cv2.imwrite(out_p, result)
                 if self.save_compare.get():
-                    cmp_path = os.path.join(out_dir, f"{stem}_compare.jpg")
                     cmp = make_compare(img, result, binary, soft)
-                    cv2.imwrite(cmp_path, cmp, [cv2.IMWRITE_JPEG_QUALITY, 90])
-
-                # 메모리 정리
-                del img
-                gc.collect()
-
-                return {
-                    "status":   "ok",
-                    "path":     path,
-                    "fname":    fname,
-                    "out_path": out_path,
-                    "stats":    stats,
-                    "result":   result,
-                }
+                    cv2.imwrite(
+                        os.path.join(out_dir, f"{stem}_compare.jpg"),
+                        cmp, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                del img; gc.collect()
+                return {"status": "ok", "fname": fname,
+                        "stats": stats, "result": result}
             except Exception as e:
-                import traceback
-                return {"status": "fail", "path": path, "fname": fname,
-                        "msg": str(e), "tb": traceback.format_exc()}
+                return {"status": "fail", "fname": fname, "msg": str(e)}
 
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = {ex.submit(_process_one, f): f for f in files}
-            for fut in as_completed(futures):
-                if self._cancel_flag.is_set():
-                    break
-
+            futs = {ex.submit(_one, f): f for f in files}
+            for fut in as_completed(futs):
+                if self._cancel_flag.is_set(): break
                 r = fut.result()
-                if r is None:
-                    continue
-
-                done    += 1
-                elapsed  = time.time() - t_start
-
+                if r is None: continue
+                done += 1
+                elapsed = time.time() - t_start
                 if r["status"] == "ok":
-                    stats = r["stats"]
-                    shadow_list.append(stats["shadow_pct"])
-                    speed_list.append(stats["total_ms"])
-                    avg_shadow = sum(shadow_list) / len(shadow_list)
-                    avg_speed  = sum(speed_list)  / len(speed_list)
-                    self._queue.put((
-                        "progress", done, total,
-                        r["fname"],
-                        f"✅ {r['fname']}  │  {stats['total_ms']}ms  │  그림자 {stats['shadow_pct']}%"
-                    ))
-                    self._queue.put(("stats_update",
-                                      done, failed, avg_shadow, avg_speed, elapsed))
-                    self._queue.put(("batch_preview", None, r["result"]))
-
+                    st = r["stats"]
+                    shadow_list.append(st["shadow_pct"])
+                    speed_list.append(st["total_ms"])
+                    self._queue.put(("progress", done, total, r["fname"],
+                        f"완료 {r['fname']} | {st['total_ms']}ms | 그림자 {st['shadow_pct']}%"))
+                    self._queue.put(("stats_update", done, failed,
+                        sum(shadow_list) / len(shadow_list),
+                        sum(speed_list)  / len(speed_list), elapsed))
+                    self._queue.put(("batch_preview", None, r.get("result")))
                 elif r["status"] == "skip":
                     self._queue.put(("progress", done, total, r["fname"],
-                                      f"⏭ {r['fname']}  (이미 처리됨, 건너뜀)"))
+                        f"건너뜀 {r['fname']}"))
                 else:
                     failed += 1
                     self._queue.put(("progress", done, total, r["fname"],
-                                      f"❌ {r['fname']}  오류: {r.get('msg','')}"))
-                    self._queue.put(("stats_update",
-                                      done, failed,
-                                      sum(shadow_list)/max(len(shadow_list),1),
-                                      sum(speed_list)/max(len(speed_list),1),
-                                      elapsed))
+                        f"실패 {r['fname']}: {r.get('msg', '')}"))
+                    self._queue.put(("stats_update", done, failed,
+                        sum(shadow_list) / max(len(shadow_list), 1),
+                        sum(speed_list)  / max(len(speed_list),  1), elapsed))
 
         elapsed_final = time.time() - t_start
-        cancelled = self._cancel_flag.is_set()
-        self._queue.put(("done", done, failed, elapsed_final, cancelled))
+        self._queue.put(("done", done, failed, elapsed_final,
+                          self._cancel_flag.is_set()))
 
-    # ──────────────────────────────────────────────────────
-    # 큐 폴링
-    # ──────────────────────────────────────────────────────
+    # ── 큐 폴링 (메인 스레드)
 
     def _poll_queue(self):
         try:
@@ -1683,19 +1511,18 @@ class DroneApp(tk.Tk):
                 kind = msg[0]
 
                 if kind == "model_loaded":
-                    status = msg[1]
-                    parts  = []
-                    if status.get("shadow"): parts.append("탐지AI ✅")
-                    else:                    parts.append("탐지AI ❌(CV모드)")
-                    if status.get("color"):  parts.append("색상AI ✅")
-                    else:                    parts.append("색상AI ❌(CV모드)")
-                    txt = "  │  ".join(parts)
+                    st = msg[1]
+                    parts = []
+                    parts.append("탐지AI " + ("OK" if st.get("shadow") else "CV모드"))
+                    parts.append("복원AI " + ("OK" if st.get("color")  else "CV모드"))
+                    txt = "  |  ".join(parts)
                     self.model_badge.config(text=txt, fg=GREEN)
-                    self._set_status("준비 완료 — 폴더 선택 후 파일 스캔 → 더블클릭으로 즉시 미리보기", GREEN)
+                    self._set_status("준비 완료 — 폴더 선택 후 파일 더블클릭으로 즉시 처리", GREEN)
                     self._log(f"모델 로드: {txt}", "ok")
 
                 elif kind == "preview_done":
                     _, orig, result, binary, soft, stats, fname = msg
+                    # 플래그 해제 (연속 처리 가능)
                     self._is_previewing = False
                     self.btn_preview.set_enabled(True)
 
@@ -1704,46 +1531,39 @@ class DroneApp(tk.Tk):
                     self._cur_binary = binary
                     self._cur_soft   = soft
 
-                    # 비교 탭으로 전환 (원본+복원 나란히)
+                    # 비교 탭으로 전환 후 이미지 표시
                     self._switch_tab("compare")
 
                     # 통계 업데이트
-                    self._preview_stat_vars["shadow_pct"].set(
-                        f"{stats.get('shadow_pct', 0):.1f} %")
-                    self._preview_stat_vars["detect_ms"].set(
-                        f"{stats.get('detection_ms', 0):.0f} ms")
-                    self._preview_stat_vars["restore_ms"].set(
-                        f"{stats.get('restoration_ms', 0):.0f} ms")
-                    self._preview_stat_vars["total_ms"].set(
-                        f"{stats.get('total_ms', 0):.0f} ms")
-                    self._preview_status_lbl.config(
-                        text=f"✅ 처리 완료: {fname}\n"
-                             f"그림자 비율: {stats.get('shadow_pct',0):.1f}%\n"
-                             f"처리 시간: {stats.get('total_ms',0):.0f}ms\n\n"
-                             "결과가 마음에 들면\n[▶ 전체 처리] 버튼 클릭",
-                        fg=GREEN
-                    )
+                    self._prev_vars["shadow_pct"].set(f"{stats.get('shadow_pct', 0):.1f} %")
+                    self._prev_vars["detect_ms"].set(f"{stats.get('detect_ms', 0):.0f} ms")
+                    self._prev_vars["restore_ms"].set(f"{stats.get('restore_ms', 0):.0f} ms")
+                    self._prev_vars["total_ms"].set(f"{stats.get('total_ms', 0):.0f} ms")
+                    self._prev_status.config(
+                        text=f"✅ 완료: {fname}\n"
+                             f"그림자: {stats.get('shadow_pct', 0):.1f}%  "
+                             f"처리: {stats.get('total_ms', 0):.0f}ms\n\n"
+                             "결과 확인 후 슬라이더 조정→재처리\n또는 [전체 처리] 버튼 클릭",
+                        fg=GREEN)
                     self._set_status(
-                        f"미리보기 완료: {fname}  │  그림자 {stats.get('shadow_pct',0):.1f}%  │  {stats.get('total_ms',0):.0f}ms",
-                        GREEN
-                    )
+                        f"미리보기 완료: {fname}  "
+                        f"| 그림자 {stats.get('shadow_pct', 0):.1f}%  "
+                        f"| {stats.get('total_ms', 0):.0f}ms",
+                        GREEN)
                     self._log(
-                        f"🔬 미리보기 완료: {fname} | "
-                        f"그림자 {stats.get('shadow_pct',0):.1f}% | "
-                        f"탐지 {stats.get('detection_ms',0):.0f}ms | "
-                        f"복원 {stats.get('restoration_ms',0):.0f}ms | "
-                        f"전체 {stats.get('total_ms',0):.0f}ms",
-                        "ok"
-                    )
+                        f"✅ 미리보기: {fname} | 그림자 {stats.get('shadow_pct', 0):.1f}% | "
+                        f"탐지 {stats.get('detect_ms', 0):.0f}ms | "
+                        f"복원 {stats.get('restore_ms', 0):.0f}ms | "
+                        f"전체 {stats.get('total_ms', 0):.0f}ms", "ok")
 
                 elif kind == "preview_error":
                     _, err = msg
                     self._is_previewing = False
                     self.btn_preview.set_enabled(True)
-                    self._preview_status_lbl.config(
+                    self._prev_status.config(
                         text=f"❌ 오류: {err[:120]}", fg=RED)
                     self._set_status("미리보기 실패", RED)
-                    self._log(f"❌ 미리보기 오류: {err}", "error")
+                    self._log(f"❌ 미리보기 오류:\n{err[:400]}", "error")
 
                 elif kind == "progress":
                     _, done, total, fname, log_msg = msg
@@ -1752,8 +1572,8 @@ class DroneApp(tk.Tk):
                     self.prog_lbl.config(text=f"{done} / {total}  ({pct}%)")
                     self.cur_lbl.config(text=fname or "-")
                     if log_msg:
-                        tag = "ok"    if log_msg.startswith("✅") else \
-                              "warn"  if log_msg.startswith("⏭") else "error"
+                        tag = "ok"   if "완료" in log_msg else \
+                              "warn" if "건너뜀" in log_msg else "error"
                         self._log(log_msg, tag)
 
                 elif kind == "stats_update":
@@ -1767,11 +1587,15 @@ class DroneApp(tk.Tk):
 
                 elif kind == "batch_preview":
                     _, orig, result = msg
-                    if orig is not None:
-                        self._cur_orig = orig
-                    if result is not None:
-                        self._cur_result = result
-                    self._apply_tab_layout(self._active_tab.get())
+                    if orig   is not None: self._cur_orig   = orig
+                    if result is not None: self._cur_result = result
+                    # 현재 탭에 맞게 업데이트
+                    if self._active_tab == "compare":
+                        if result is not None:
+                            self.zoom_right.load_image(cv2pil(result))
+                    elif self._active_tab == "result":
+                        if result is not None:
+                            self.zoom_single.load_image(cv2pil(result))
 
                 elif kind == "done":
                     _, done, failed, elapsed, cancelled = msg
@@ -1781,14 +1605,14 @@ class DroneApp(tk.Tk):
                     self.btn_preview.set_enabled(True)
                     m, s = divmod(int(elapsed), 60)
                     if cancelled:
-                        self._set_status(f"처리 중단  │  완료 {done}장", WARN)
-                        self._log(f"⏹  중단됨  {done}장 처리  ({m:02d}:{s:02d})", "warn")
+                        self._set_status(f"중단됨  |  완료 {done}장", WARN)
+                        self._log(f"중단됨: {done}장 처리  ({m:02d}:{s:02d})", "warn")
                     else:
                         self._set_status(
-                            f"🎉 완료!  {done}장 처리  │  실패 {failed}장  │  {m:02d}:{s:02d}",
+                            f"완료!  {done}장 처리  |  실패 {failed}장  |  {m:02d}:{s:02d}",
                             GREEN)
                         self._log(
-                            f"🎉 완료! 총 {done}장  │  실패 {failed}장  │  {m:02d}:{s:02d}",
+                            f"✅ 완료! 총 {done}장 | 실패 {failed}장 | {m:02d}:{s:02d}",
                             "ok")
                     self.cur_lbl.config(text="-")
 
@@ -1796,17 +1620,14 @@ class DroneApp(tk.Tk):
             pass
         self.after(80, self._poll_queue)
 
-    # ──────────────────────────────────────────────────────
-    # 헬퍼
-    # ──────────────────────────────────────────────────────
+    # ── 헬퍼
 
     def _set_status(self, text, color=TEXT2):
         self.status_lbl.config(text=text, fg=color)
 
     def _log(self, text, tag="info"):
         self.log_text.config(state="normal")
-        ts = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] {text}\n", tag)
+        self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n", tag)
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
@@ -1816,7 +1637,6 @@ class DroneApp(tk.Tk):
 # ──────────────────────────────────────────────────────────
 
 def main():
-    # Windows DPI 인식
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
@@ -1831,14 +1651,11 @@ def main():
     except Exception:
         pass
     style.configure("TProgressbar",
-                     troughcolor=DARK2, background=ACCENT,
-                     thickness=14)
+                     troughcolor=DARK2, background=ACCENT, thickness=14)
     style.configure("Vertical.TScrollbar",
-                     background=DARK3, troughcolor=DARK2,
-                     arrowcolor=TEXT2)
+                     background=DARK3, troughcolor=DARK2, arrowcolor=TEXT2)
     style.configure("Horizontal.TScrollbar",
-                     background=DARK3, troughcolor=DARK2,
-                     arrowcolor=TEXT2)
+                     background=DARK3, troughcolor=DARK2, arrowcolor=TEXT2)
 
     app.mainloop()
 

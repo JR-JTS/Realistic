@@ -1,13 +1,9 @@
 """
-Processing Pipeline  –  드론 사진 그림자 제거 + 색상 복원
-고속 최적화 버전 v2.2
+Processing Pipeline  –  드론 사진 그림자 제거 + 색상 복원  v3.0
 
 처리 경로:
-  preview_mode=True  → 최대 800px 썸네일로 처리 (즉각 미리보기용)
-  preview_mode=False → 원본 해상도 풀 처리 (저장 품질)
-
-목표 속도 (preview_mode=True):
-  어떤 해상도든 < 500ms
+  preview_mode=True  → 최대 800px 썸네일로 처리 (즉각 미리보기용, < 500ms 목표)
+  preview_mode=False → 원본 해상도 풀 처리 (배치 저장용)
 """
 
 import cv2
@@ -33,9 +29,11 @@ from color_restoration import (
 # ──────────────────────────────────────────────────────────
 # 지원 확장자
 # ──────────────────────────────────────────────────────────
-SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.tif', '.tiff',
-                  '.bmp', '.webp', '.JPG', '.JPEG', '.PNG',
-                  '.TIF', '.TIFF'}
+SUPPORTED_EXT = {
+    '.jpg', '.jpeg', '.png', '.tif', '.tiff',
+    '.bmp', '.webp',
+    '.JPG', '.JPEG', '.PNG', '.TIF', '.TIFF',
+}
 
 
 # ──────────────────────────────────────────────────────────
@@ -91,10 +89,8 @@ def load_models(model_dir: str = "models") -> Dict[str, bool]:
 # 단일 이미지 처리
 # ──────────────────────────────────────────────────────────
 
-# 미리보기용 최대 크기 (한 변 기준 px)
-PREVIEW_MAX_PX  = 800
-# 배치 저장용 최대 크기 (한 변 기준 px, 0=무제한)
-BATCH_MAX_PX    = 0
+PREVIEW_MAX_PX = 800   # 미리보기용 최대 픽셀 (한 변 기준)
+BATCH_MAX_PX   = 0     # 배치 저장용 (0 = 무제한)
 
 
 def _resize_for_processing(img: np.ndarray, max_px: int):
@@ -106,8 +102,8 @@ def _resize_for_processing(img: np.ndarray, max_px: int):
     if long_side <= max_px:
         return img, 1.0
     scale = max_px / long_side
-    new_w = int(w * scale)
-    new_h = int(h * scale)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
     resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return resized, scale
 
@@ -115,64 +111,71 @@ def _resize_for_processing(img: np.ndarray, max_px: int):
 def process_single(
     img_bgr: np.ndarray,
     # 탐지
-    detection_mode: str  = 'hybrid',
-    sensitivity: float   = 0.5,
-    feather: int         = 25,
+    detection_mode: str   = 'cv',
+    sensitivity: float    = 0.45,
+    feather: int          = 20,
     # 복원
-    radio_strength: float    = 0.80,
-    color_strength: float    = 0.65,
-    retinex_strength: float  = 0.30,
-    use_ai_color: bool       = True,
+    radio_strength: float    = 0.70,
+    color_strength: float    = 0.55,
+    retinex_strength: float  = 0.20,
+    use_ai_color: bool       = False,
     # 선명화
-    denoise_h: int           = 6,
-    sharpen_amount: float    = 1.4,
-    clahe_clip: float        = 2.0,
+    denoise_h: int           = 4,
+    sharpen_amount: float    = 1.0,
+    clahe_clip: float        = 1.8,
     # 처리 모드
     preview_mode: bool       = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
-    Returns: (result, binary_mask, soft_mask, stats_dict)
+    단일 이미지 처리.
+    Returns: (result_bgr, binary_mask, soft_mask, stats_dict)
 
-    preview_mode=True  : 최대 800px로 줄여서 처리 후 원본 크기 upscale
-                         (결과 이미지는 원본과 같은 크기 반환)
+    preview_mode=True  : PREVIEW_MAX_PX 이하로 처리 후 원본 크기로 upscale 반환
     preview_mode=False : 원본 해상도 그대로 처리
     """
     stats  = {}
     orig_h, orig_w = img_bgr.shape[:2]
 
     # ── 처리 해상도 결정
-    max_px = PREVIEW_MAX_PX if preview_mode else BATCH_MAX_PX
+    max_px   = PREVIEW_MAX_PX if preview_mode else BATCH_MAX_PX
     work_img, scale = _resize_for_processing(img_bgr, max_px)
     wh, ww = work_img.shape[:2]
 
     # ── 1. 그림자 탐지 (work 해상도)
     t0 = time.perf_counter()
-    if detection_mode == 'hybrid':
-        binary = detect_shadow_ai(work_img, _shadow_model, _device)
-    else:
+    try:
+        if detection_mode == 'hybrid' and _shadow_model is not None:
+            binary = detect_shadow_ai(work_img, _shadow_model, _device)
+        else:
+            binary = detect_shadow_cv(work_img, sensitivity)
+    except Exception as e:
+        print(f"Shadow detection error: {e}, fallback to CV")
         binary = detect_shadow_cv(work_img, sensitivity)
+
     soft = get_soft_mask(binary, feather)
     stats['detection_ms'] = round((time.perf_counter() - t0) * 1000, 1)
     stats['detect_ms']    = stats['detection_ms']
-    stats['shadow_pct']   = round(float((binary > 0).sum()) / (wh * ww) * 100, 1)
+    stats['shadow_pct']   = round(float((binary > 0).sum()) / max(wh * ww, 1) * 100, 1)
 
     # ── 2. 색상 복원 (work 해상도에서 처리)
     t0 = time.perf_counter()
     ai_model = _color_model if use_ai_color else None
-    # work_img/soft를 직접 전달해 파이프라인 내부에서 중복 축소 방지
-    result = restore_shadow_color(
-        img_bgr, soft if scale >= 1.0 else cv2.resize(soft, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR),
-        radio_strength=radio_strength,
-        color_strength=color_strength,
-        retinex_strength=retinex_strength,
-        ai_model=ai_model,
-        device=_device,
-        denoise_h=denoise_h,
-        sharpen_amount=sharpen_amount,
-        clahe_clip=clahe_clip,
-        _work_img=work_img,
-        _work_mask=soft,
-    )
+    try:
+        result = restore_shadow_color(
+            work_img, soft,
+            radio_strength=radio_strength,
+            color_strength=color_strength,
+            retinex_strength=retinex_strength,
+            ai_model=ai_model,
+            device=_device,
+            denoise_h=denoise_h,
+            sharpen_amount=sharpen_amount,
+            clahe_clip=clahe_clip,
+        )
+    except Exception as e:
+        print(f"Color restoration error: {e}")
+        result = work_img.copy()
+
     stats['restoration_ms'] = round((time.perf_counter() - t0) * 1000, 1)
     stats['restore_ms']     = stats['restoration_ms']
     stats['total_ms']       = stats['detection_ms'] + stats['restoration_ms']
@@ -180,7 +183,7 @@ def process_single(
     stats['work_size']      = f"{ww}×{wh}"
 
     # ── 3. 미리보기 모드: 결과를 원본 크기로 upscale
-    if preview_mode and scale < 1.0:
+    if scale < 1.0:
         result = cv2.resize(result, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         binary = cv2.resize(binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
         soft   = cv2.resize(soft,   (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
@@ -194,12 +197,16 @@ def process_single(
 
 def scan_folder(folder: str) -> list:
     p = Path(folder)
+    if not p.is_dir():
+        return []
     return [str(f) for f in sorted(p.iterdir())
             if f.is_file() and f.suffix in SUPPORTED_EXT]
 
 
 def scan_folder_recursive(folder: str) -> list:
     p = Path(folder)
+    if not p.is_dir():
+        return []
     return [str(f) for f in sorted(p.rglob('*'))
             if f.is_file() and f.suffix in SUPPORTED_EXT]
 
