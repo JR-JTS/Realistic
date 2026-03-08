@@ -777,18 +777,21 @@ class DroneApp(tk.Tk):
         self.sl_sensitivity = self._slider(p, "탐지 민감도",   0.1, 1.0, 0.45)
         self.sl_feather     = self._slider(p, "마스크 페더링", 3,   50,  20, fmt=".0f")
 
-        # ── 색상 복원 설정
-        self._section(p, "색상 복원")
+        # ── 색상 복원 설정 (v6.0)
+        self._section(p, "그림자 색상+밝기 복원")
         self.use_ai_color = tk.BooleanVar(value=True)
-        tk.Checkbutton(p, text="AI 색상 보정 (모델 로드 시 활성)",
+        tk.Checkbutton(p, text="AI 미세 보정 (모델 로드 시 활성)",
                         variable=self.use_ai_color,
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
+        self.use_hue_consist = tk.BooleanVar(value=True)
+        tk.Checkbutton(p, text="Hue 기반 정밀 색상 복원 (권장)",
+                        variable=self.use_hue_consist,
+                        bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
+                        font=("Segoe UI", 9)).pack(anchor="w", padx=12)
 
-        self.sl_radio   = self._slider(p, "Shadow 복원 강도",   0.0, 1.0, 0.70)
-        self.sl_highlight = self._slider(p, "Highlight 압축",    0.0, 0.6, 0.20)
-        self.sl_midtone = self._slider(p,   "Midtone 대비",       0.0, 0.5, 0.15)
-        self.sl_color   = self._slider(p, "색상 편이 보정",    0.0, 0.8, 0.35)
+        self.sl_radio    = self._slider(p, "색상+밝기 복원 강도", 0.3, 1.0, 0.90)
+        self.sl_highlight = self._slider(p, "Highlight 보호",     0.0, 0.6, 0.25)
 
         # ── 영상 품질 개선
         self._section(p, "영상 품질 개선")
@@ -1418,19 +1421,25 @@ class DroneApp(tk.Tk):
 
     def _collect_params(self):
         return {
-            "detection_mode":   self.detect_mode.get(),
-            "sensitivity":      float(self.sl_sensitivity.get()),
-            "feather":          int(self.sl_feather.get()),
-            "shadow_amount":    float(self.sl_radio.get()),
-            "highlight_amount": float(self.sl_highlight.get()),
-            "midtone_contrast": float(self.sl_midtone.get()),
-            "color_strength":   float(self.sl_color.get()),
-            "use_ai_color":     bool(self.use_ai_color.get()),
-            "denoise_h":        int(self.sl_denoise.get()),
-            "sharpen_amount":   float(self.sl_sharpen.get()),
-            "clahe_clip":       float(self.sl_clahe.get()),
-            "radio_strength":   float(self.sl_radio.get()),
-            "retinex_strength": 0.0,
+            "detection_mode":         self.detect_mode.get(),
+            "sensitivity":            float(self.sl_sensitivity.get()),
+            "feather":                int(self.sl_feather.get()),
+            # v6.0 색상 복원 파라미터
+            "color_restore_strength": float(self.sl_radio.get()),
+            "use_hue_consistent":     bool(self.use_hue_consist.get()),
+            "highlight_protect":      float(self.sl_highlight.get()),
+            "use_ai_color":           bool(self.use_ai_color.get()),
+            # 품질 개선
+            "denoise_h":              int(self.sl_denoise.get()),
+            "sharpen_amount":         float(self.sl_sharpen.get()),
+            "clahe_clip":             float(self.sl_clahe.get()),
+            # 하위 호환성
+            "shadow_amount":          float(self.sl_radio.get()),
+            "highlight_amount":       float(self.sl_highlight.get()),
+            "radio_strength":         float(self.sl_radio.get()),
+            "retinex_strength":       0.0,
+            "shadow_lift":            0.20,
+            "blur_radius":            60,
         }
 
     # ── 배치 처리 스레드

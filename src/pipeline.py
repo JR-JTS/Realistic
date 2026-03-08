@@ -114,21 +114,26 @@ def process_single(
     detection_mode: str   = 'hybrid',
     sensitivity: float    = 0.45,
     feather: int          = 20,
-    # Shadow/Highlight 복원 (v4.0)
-    shadow_amount: float     = 0.70,    # 그림자 밝기 복원 강도
-    highlight_amount: float  = 0.20,    # 하이라이트 압축 (과보정 방지)
-    midtone_contrast: float  = 0.15,    # 중간톤 대비
-    color_strength: float    = 0.35,    # 색상 편이 보정
-    use_ai_color: bool       = True,
+    # v6.0 색상 복원 핵심 파라미터
+    color_restore_strength: float = 0.90,  # per-channel gain 복원 강도 (0~1)
+    use_hue_consistent: bool      = True,  # Hue 기반 정밀 gain 사용
+    highlight_protect: float      = 0.25,  # 하이라이트 압축
+    use_ai_color: bool            = True,
     # 품질 개선
-    denoise_h: int           = 5,
-    sharpen_amount: float    = 0.8,
-    clahe_clip: float        = 2.0,
-    # 하위 호환성
-    radio_strength: float    = 0.70,
-    retinex_strength: float  = 0.20,
+    denoise_h: int                = 4,
+    sharpen_amount: float         = 0.8,
+    clahe_clip: float             = 2.0,
+    # 하위 호환성 (GUI 구버전 슬라이더 대응)
+    shadow_amount: float          = 0.70,
+    highlight_amount: float       = 0.20,
+    midtone_contrast: float       = 0.15,
+    color_strength: float         = 0.35,
+    radio_strength: float         = 0.70,
+    retinex_strength: float       = 0.0,
+    shadow_lift: float            = 0.30,
+    blur_radius: int              = 60,
     # 처리 모드
-    preview_mode: bool       = False,
+    preview_mode: bool            = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
     단일 이미지 처리.
@@ -167,17 +172,20 @@ def process_single(
     try:
         result = restore_shadow_color(
             work_img, soft,
-            shadow_amount     = shadow_amount,
-            highlight_amount  = highlight_amount,
-            midtone_contrast  = midtone_contrast,
-            color_strength    = color_strength,
-            ai_model          = ai_model,
-            device            = _device,
-            denoise_h         = denoise_h,
-            sharpen_amount    = sharpen_amount,
-            clahe_clip        = clahe_clip,
-            radio_strength    = radio_strength,
-            retinex_strength  = retinex_strength,
+            color_restore_strength = color_restore_strength,
+            use_hue_consistent     = use_hue_consistent,
+            highlight_protect      = highlight_protect,
+            ai_model               = ai_model,
+            device                 = _device,
+            denoise_h              = denoise_h,
+            sharpen_amount         = sharpen_amount,
+            clahe_clip             = clahe_clip,
+            # 하위 호환성 전달
+            shadow_amount          = shadow_amount,
+            highlight_amount       = highlight_amount,
+            radio_strength         = radio_strength,
+            shadow_lift            = shadow_lift,
+            blur_radius            = blur_radius,
         )
     except Exception as e:
         print(f"Color restoration error: {e}")
