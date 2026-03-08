@@ -1399,8 +1399,8 @@ class DroneApp(tk.Tk):
 
         self._is_previewing = True
         self.btn_preview.set_enabled(False)
-        self._preview_status_lbl.config(text="⏳ 처리 중...", fg=WARN)
-        self._set_status(f"처리 중: {os.path.basename(self._selected_path)}", WARN)
+        self._preview_status_lbl.config(text="⏳ 미리보기 처리 중 (최대 800px)...", fg=WARN)
+        self._set_status(f"미리보기 처리 중: {os.path.basename(self._selected_path)}", WARN)
 
         params = self._collect_params()
         path   = self._selected_path
@@ -1411,6 +1411,7 @@ class DroneApp(tk.Tk):
                 self._queue.put(("preview_error", "이미지를 읽을 수 없습니다."))
                 return
             try:
+                h, w = img.shape[:2]
                 result, binary, soft, stats = process_single(
                     img,
                     detection_mode=params["detection_mode"],
@@ -1423,6 +1424,7 @@ class DroneApp(tk.Tk):
                     denoise_h=params["denoise_h"],
                     sharpen_amount=params["sharpen_amount"],
                     clahe_clip=params["clahe_clip"],
+                    preview_mode=True,   # ★ 고속 미리보기 모드 (최대 800px 축소 처리)
                 )
                 self._queue.put(("preview_done", img, result, binary, soft, stats,
                                  os.path.basename(path)))
@@ -1545,6 +1547,7 @@ class DroneApp(tk.Tk):
                     denoise_h=params["denoise_h"],
                     sharpen_amount=params["sharpen_amount"],
                     clahe_clip=params["clahe_clip"],
+                    preview_mode=False,  # ★ 배치: 원본 해상도 풀 처리
                 )
                 cv2.imwrite(out_path, result)
 

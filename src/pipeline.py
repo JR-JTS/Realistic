@@ -1,5 +1,13 @@
 """
 Processing Pipeline  –  드론 사진 그림자 제거 + 색상 복원
+고속 최적화 버전 v2.2
+
+처리 경로:
+  preview_mode=True  → 최대 800px 썸네일로 처리 (즉각 미리보기용)
+  preview_mode=False → 원본 해상도 풀 처리 (저장 품질)
+
+목표 속도 (preview_mode=True):
+  어떤 해상도든 < 500ms
 """
 
 import cv2
@@ -31,7 +39,7 @@ SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.tif', '.tiff',
 
 
 # ──────────────────────────────────────────────────────────
-# 전역 모델 (앱 시작 시 1회 로드)
+# 전역 모델
 # ──────────────────────────────────────────────────────────
 _device        = 'cpu'
 _shadow_model: Optional[ShadowDetectorNet]   = None
@@ -40,37 +48,40 @@ _color_model:  Optional[ColorRestorationNet] = None
 
 def load_models(model_dir: str = "models") -> Dict[str, bool]:
     global _shadow_model, _color_model
-
     status = {}
 
-    # Shadow detection model
     sp = os.path.join(model_dir, "shadow_detector.pth")
     if os.path.exists(sp):
         try:
             _shadow_model = ShadowDetectorNet()
-            _shadow_model.load_state_dict(torch.load(sp, map_location=_device))
+            _shadow_model.load_state_dict(
+                torch.load(sp, map_location=_device, weights_only=True))
             _shadow_model.eval()
             status['shadow'] = True
+            print(f"Shadow model loaded: {sp}")
         except Exception as e:
             print(f"Shadow model load failed: {e}")
             _shadow_model = None
             status['shadow'] = False
     else:
+        print(f"No shadow model at {sp} → using CV detection")
         status['shadow'] = False
 
-    # Color restoration model
     cp = os.path.join(model_dir, "color_restore.pth")
     if os.path.exists(cp):
         try:
             _color_model = ColorRestorationNet()
-            _color_model.load_state_dict(torch.load(cp, map_location=_device))
+            _color_model.load_state_dict(
+                torch.load(cp, map_location=_device, weights_only=True))
             _color_model.eval()
             status['color'] = True
+            print(f"Color model loaded: {cp}")
         except Exception as e:
             print(f"Color model load failed: {e}")
             _color_model = None
             status['color'] = False
     else:
+        print(f"No color model at {cp} → using CV restoration")
         status['color'] = False
 
     return status
@@ -80,43 +91,77 @@ def load_models(model_dir: str = "models") -> Dict[str, bool]:
 # 단일 이미지 처리
 # ──────────────────────────────────────────────────────────
 
+# 미리보기용 최대 크기 (한 변 기준 px)
+PREVIEW_MAX_PX  = 800
+# 배치 저장용 최대 크기 (한 변 기준 px, 0=무제한)
+BATCH_MAX_PX    = 0
+
+
+def _resize_for_processing(img: np.ndarray, max_px: int):
+    """max_px 이하로 비율 축소. max_px=0이면 원본 반환."""
+    if max_px <= 0:
+        return img, 1.0
+    h, w = img.shape[:2]
+    long_side = max(h, w)
+    if long_side <= max_px:
+        return img, 1.0
+    scale = max_px / long_side
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
 def process_single(
     img_bgr: np.ndarray,
     # 탐지
-    detection_mode: str = 'hybrid',      # 'cv' | 'hybrid'
-    sensitivity: float  = 0.5,
-    feather: int        = 25,
+    detection_mode: str  = 'hybrid',
+    sensitivity: float   = 0.5,
+    feather: int         = 25,
     # 복원
-    radio_strength: float   = 0.80,
-    color_strength: float   = 0.65,
-    retinex_strength: float = 0.30,
-    use_ai_color: bool      = True,
+    radio_strength: float    = 0.80,
+    color_strength: float    = 0.65,
+    retinex_strength: float  = 0.30,
+    use_ai_color: bool       = True,
     # 선명화
-    denoise_h: int         = 6,
-    sharpen_amount: float  = 1.4,
-    clahe_clip: float      = 2.0,
+    denoise_h: int           = 6,
+    sharpen_amount: float    = 1.4,
+    clahe_clip: float        = 2.0,
+    # 처리 모드
+    preview_mode: bool       = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
     Returns: (result, binary_mask, soft_mask, stats_dict)
-    """
-    stats = {}
-    h, w  = img_bgr.shape[:2]
 
-    # 1. Shadow Detection
+    preview_mode=True  : 최대 800px로 줄여서 처리 후 원본 크기 upscale
+                         (결과 이미지는 원본과 같은 크기 반환)
+    preview_mode=False : 원본 해상도 그대로 처리
+    """
+    stats  = {}
+    orig_h, orig_w = img_bgr.shape[:2]
+
+    # ── 처리 해상도 결정
+    max_px = PREVIEW_MAX_PX if preview_mode else BATCH_MAX_PX
+    work_img, scale = _resize_for_processing(img_bgr, max_px)
+    wh, ww = work_img.shape[:2]
+
+    # ── 1. 그림자 탐지 (work 해상도)
     t0 = time.perf_counter()
     if detection_mode == 'hybrid':
-        binary = detect_shadow_ai(img_bgr, _shadow_model, _device)
+        binary = detect_shadow_ai(work_img, _shadow_model, _device)
     else:
-        binary = detect_shadow_cv(img_bgr, sensitivity)
+        binary = detect_shadow_cv(work_img, sensitivity)
     soft = get_soft_mask(binary, feather)
-    stats['detect_ms'] = round((time.perf_counter() - t0) * 1000, 1)
-    stats['shadow_pct'] = round(float((binary > 0).sum()) / (h * w) * 100, 1)
+    stats['detection_ms'] = round((time.perf_counter() - t0) * 1000, 1)
+    stats['detect_ms']    = stats['detection_ms']
+    stats['shadow_pct']   = round(float((binary > 0).sum()) / (wh * ww) * 100, 1)
 
-    # 2. Color Restoration
+    # ── 2. 색상 복원 (work 해상도에서 처리)
     t0 = time.perf_counter()
     ai_model = _color_model if use_ai_color else None
+    # work_img/soft를 직접 전달해 파이프라인 내부에서 중복 축소 방지
     result = restore_shadow_color(
-        img_bgr, soft,
+        img_bgr, soft if scale >= 1.0 else cv2.resize(soft, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR),
         radio_strength=radio_strength,
         color_strength=color_strength,
         retinex_strength=retinex_strength,
@@ -125,9 +170,20 @@ def process_single(
         denoise_h=denoise_h,
         sharpen_amount=sharpen_amount,
         clahe_clip=clahe_clip,
+        _work_img=work_img,
+        _work_mask=soft,
     )
-    stats['restore_ms'] = round((time.perf_counter() - t0) * 1000, 1)
-    stats['total_ms']   = stats['detect_ms'] + stats['restore_ms']
+    stats['restoration_ms'] = round((time.perf_counter() - t0) * 1000, 1)
+    stats['restore_ms']     = stats['restoration_ms']
+    stats['total_ms']       = stats['detection_ms'] + stats['restoration_ms']
+    stats['preview_mode']   = preview_mode
+    stats['work_size']      = f"{ww}×{wh}"
+
+    # ── 3. 미리보기 모드: 결과를 원본 크기로 upscale
+    if preview_mode and scale < 1.0:
+        result = cv2.resize(result, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        binary = cv2.resize(binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        soft   = cv2.resize(soft,   (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
     return result, binary, soft, stats
 
@@ -137,19 +193,15 @@ def process_single(
 # ──────────────────────────────────────────────────────────
 
 def scan_folder(folder: str) -> list:
-    """폴더 내 지원 이미지 파일 목록 반환 (재귀 없음)"""
     p = Path(folder)
-    files = [str(f) for f in sorted(p.iterdir())
-             if f.is_file() and f.suffix in SUPPORTED_EXT]
-    return files
+    return [str(f) for f in sorted(p.iterdir())
+            if f.is_file() and f.suffix in SUPPORTED_EXT]
 
 
 def scan_folder_recursive(folder: str) -> list:
-    """하위 폴더까지 재귀 탐색"""
     p = Path(folder)
-    files = [str(f) for f in sorted(p.rglob('*'))
-             if f.is_file() and f.suffix in SUPPORTED_EXT]
-    return files
+    return [str(f) for f in sorted(p.rglob('*'))
+            if f.is_file() and f.suffix in SUPPORTED_EXT]
 
 
 # ──────────────────────────────────────────────────────────
@@ -160,33 +212,32 @@ def make_compare(orig: np.ndarray,
                   result: np.ndarray,
                   binary: np.ndarray,
                   soft: np.ndarray) -> np.ndarray:
-    """4-panel: 원본 | 그림자 마스크(채색) | 복원 | diff"""
+    """4-panel: 원본 | 그림자 마스크 | 복원 | Diff×3"""
     h, w = orig.shape[:2]
 
-    # 그림자 마스크 시각화
     mask_vis = orig.copy()
     overlay  = np.zeros_like(orig)
     overlay[binary > 0] = [0, 80, 255]
     mask_vis = cv2.addWeighted(mask_vis, 0.55, overlay, 0.45, 0)
 
-    # Diff (복원 전후 차이 × 3 강조)
-    diff = np.clip((result.astype(np.int32) - orig.astype(np.int32)) * 3 + 128, 0, 255).astype(np.uint8)
+    diff = np.clip(
+        (result.astype(np.int32) - orig.astype(np.int32)) * 3 + 128,
+        0, 255).astype(np.uint8)
 
     font  = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.45, min(1.1, w / 900))
-    thick = max(1, int(scale * 2))
+    sc    = max(0.45, min(1.1, w / 900))
+    thick = max(1, int(sc * 2))
 
-    def label(img, text, col=(255,255,255)):
+    def label(img, text, col=(255, 255, 255)):
         out = img.copy()
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
-        cv2.rectangle(out, (6, 6), (16+tw, 18+th), (0,0,0), -1)
-        cv2.putText(out, text, (11, 11+th), font, scale, col, thick, cv2.LINE_AA)
+        (tw, th), _ = cv2.getTextSize(text, font, sc, thick)
+        cv2.rectangle(out, (6, 6), (16 + tw, 18 + th), (0, 0, 0), -1)
+        cv2.putText(out, text, (11, 11 + th), font, sc, col, thick, cv2.LINE_AA)
         return out
 
-    panels = [
-        label(orig,     "Original",    (200,200,200)),
-        label(mask_vis, "Shadow Mask", (0,160,255)),
-        label(result,   "Restored",    (80,255,80)),
-        label(diff,     "Diff x3",     (255,200,80)),
-    ]
-    return cv2.hconcat(panels)
+    return cv2.hconcat([
+        label(orig,     "Original",    (200, 200, 200)),
+        label(mask_vis, "Shadow Mask", (0, 160, 255)),
+        label(result,   "Restored",    (80, 255, 80)),
+        label(diff,     "Diff x3",     (255, 200, 80)),
+    ])
