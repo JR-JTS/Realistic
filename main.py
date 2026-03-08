@@ -1,15 +1,18 @@
 """
 Drone Shadow Remover & Color Restorer
-Desktop Application  –  Tkinter GUI  v2.1
+Desktop Application  –  Tkinter GUI  v2.2
 ────────────────────────────────────────
 실행: python main.py
 
-새 기능 (v2.1):
+새 기능 (v2.2):
+  • 파일 더블클릭 즉시 미리보기 처리
+  • 비교 탭: 원본|복원 나란히 + 분할선 + 더 큰 레이블
+  • 원본 탭에서도 줌/패닝 가능
+  • 복원 탭에서도 줌/패닝 가능
   • AI 모델 다운로드 창 (헤더 버튼)
-  • 단일 이미지 사전 처리 & 미리보기 (파일 선택 → "이 이미지 처리" 버튼)
-  • 원본/복원 이미지 줌(마우스 휠), 패닝(드래그)
-  • 마음에 들면 "전체 배치 처리 시작" 버튼으로 일괄 처리
-  • 처리 결과 마음에 안 들면 파라미터 조정 후 재처리 가능
+  • 메모리 절약 모델 로딩 (한 번에 하나씩)
+  • 미리보기 결과 → 파라미터 조정 → 재처리 워크플로
+  • 전체 배치 처리 (멀티스레드)
 """
 
 import tkinter as tk
@@ -23,6 +26,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 
 import cv2
 import numpy as np
@@ -38,7 +42,6 @@ from pipeline import (
 # ──────────────────────────────────────────────────────────
 # AI 모델 다운로드 정보
 # ──────────────────────────────────────────────────────────
-# 다운로드 서버 베이스 URL (배포 시 실제 URL로 교체 가능)
 MODEL_SERVER_BASE = "https://8080-i65w3eivwijb8fftrewca-2b54fc91.sandbox.novita.ai"
 
 MODEL_INFO = [
@@ -201,19 +204,16 @@ class ModelDownloadDialog(tk.Toplevel):
         self.grab_set()
 
         self._model_dir      = model_dir
-        self._reload_cb      = reload_callback   # 다운로드 후 모델 재로드 콜백
-        self._dl_threads     = {}                # name → thread
-        self._cancel_flags   = {}                # name → threading.Event
+        self._reload_cb      = reload_callback
+        self._dl_threads     = {}
+        self._cancel_flags   = {}
         self._queue          = queue.Queue()
 
         self._build_ui()
         self._refresh_status()
         self._poll()
 
-    # ── UI 구성 ──────────────────────────────────────────
-
     def _build_ui(self):
-        # 헤더
         hdr = tk.Frame(self, bg=DARK3, height=52)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
@@ -225,7 +225,6 @@ class ModelDownloadDialog(tk.Toplevel):
                   bg=DARK3, fg=TEXT2,
                   font=("Segoe UI", 9)).pack(side="left", padx=4)
 
-        # 서버 URL 입력
         url_f = tk.Frame(self, bg=DARK2, pady=6)
         url_f.pack(fill="x", padx=12, pady=(8,0))
         tk.Label(url_f, text="다운로드 서버 URL:",
@@ -241,7 +240,6 @@ class ModelDownloadDialog(tk.Toplevel):
                     width=60, height=28, font_size=9
         ).pack(side="left", padx=6)
 
-        # 안내 텍스트
         info_f = tk.Frame(self, bg=DARK, pady=4)
         info_f.pack(fill="x", padx=12)
         tk.Label(info_f,
@@ -250,13 +248,11 @@ class ModelDownloadDialog(tk.Toplevel):
                   bg=DARK, fg=TEXT2, font=("Segoe UI",8),
                   wraplength=640, justify="left").pack(anchor="w")
 
-        # 모델 카드 목록
         self._cards = {}
         for info in MODEL_INFO:
             card = self._make_model_card(info)
             self._cards[info["name"]] = card
 
-        # 하단 버튼
         btn_f = tk.Frame(self, bg=DARK, pady=8)
         btn_f.pack(fill="x", padx=12)
 
@@ -278,7 +274,6 @@ class ModelDownloadDialog(tk.Toplevel):
                     width=140, height=36, font_size=10
         ).pack(side="left")
 
-        # 전체 진행 로그
         log_f = tk.Frame(self, bg=CARD)
         log_f.pack(fill="both", expand=True, padx=12, pady=(4,8))
         tk.Label(log_f, text="📋 다운로드 로그",
@@ -299,13 +294,11 @@ class ModelDownloadDialog(tk.Toplevel):
         self._log_text.tag_config("info",  foreground=TEXT2)
 
     def _make_model_card(self, info: dict) -> dict:
-        """모델 1개짜리 카드 위젯 묶음 반환"""
         name = info["name"]
 
         card = tk.Frame(self, bg=CARD, padx=12, pady=10)
         card.pack(fill="x", padx=12, pady=4)
 
-        # 왼쪽: 이름 + 설명
         left = tk.Frame(card, bg=CARD)
         left.pack(side="left", fill="both", expand=True)
 
@@ -316,7 +309,6 @@ class ModelDownloadDialog(tk.Toplevel):
                              font=("Segoe UI",10,"bold"))
         name_lbl.pack(side="left")
 
-        # 상태 배지
         status_lbl = tk.Label(title_f, text="…",
                                bg=CARD, fg=TEXT2,
                                font=("Segoe UI",8), padx=8)
@@ -328,14 +320,12 @@ class ModelDownloadDialog(tk.Toplevel):
                               justify="left", anchor="w")
         desc_lbl.pack(fill="x", pady=(2,4))
 
-        # 진행바
         prog = ttk.Progressbar(left, mode="determinate", length=400)
         prog.pack(fill="x", pady=(2,0))
         prog_lbl = tk.Label(left, text="",
                              bg=CARD, fg=TEXT2, font=("Consolas",8))
         prog_lbl.pack(anchor="e")
 
-        # 오른쪽: 버튼
         right = tk.Frame(card, bg=CARD)
         right.pack(side="right", padx=(12,0))
 
@@ -361,8 +351,6 @@ class ModelDownloadDialog(tk.Toplevel):
             "cancel_btn": cancel_btn,
         }
 
-    # ── 상태 새로고침 ──────────────────────────────────
-
     def _refresh_status(self):
         for name, card in self._cards.items():
             path = os.path.join(self._model_dir, name)
@@ -378,17 +366,14 @@ class ModelDownloadDialog(tk.Toplevel):
                 card["prog_lbl"].config(text="")
 
     def _apply_url(self):
-        """서버 URL 변경 시 MODEL_INFO URL 업데이트"""
         base = self._url_var.get().rstrip("/")
         for info in MODEL_INFO:
             info["url"] = base + "/models/" + info["dest"]
         self._log("URL 변경: " + base, "info")
 
-    # ── 다운로드 로직 ──────────────────────────────────
-
     def _download_one(self, name: str):
         if name in self._dl_threads and self._dl_threads[name].is_alive():
-            return  # 이미 진행 중
+            return
 
         info  = next(i for i in MODEL_INFO if i["name"] == name)
         card  = self._cards[name]
@@ -408,12 +393,12 @@ class ModelDownloadDialog(tk.Toplevel):
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "DroneShadowRemover/2.1"}
+                    headers={"User-Agent": "DroneShadowRemover/2.2"}
                 )
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     total = int(resp.headers.get("Content-Length", 0))
                     downloaded = 0
-                    chunk = 65536   # 64 KB
+                    chunk = 65536
                     t_start = time.time()
 
                     with open(dest_path, "wb") as f:
@@ -428,7 +413,7 @@ class ModelDownloadDialog(tk.Toplevel):
                             downloaded += len(data)
 
                             elapsed = max(time.time() - t_start, 0.001)
-                            speed   = downloaded / elapsed / 1024  # KB/s
+                            speed   = downloaded / elapsed / 1024
                             pct     = int(downloaded / total * 100) if total else 0
                             self._queue.put((
                                 "dl_progress", name,
@@ -441,7 +426,6 @@ class ModelDownloadDialog(tk.Toplevel):
                 self._queue.put(("dl_done", name,
                                   f"✅ 완료: {info['dest']}  ({sz:.1f} MB)"))
             except Exception as e:
-                # 실패 시 불완전 파일 삭제
                 if os.path.exists(dest_path):
                     try:
                         os.remove(dest_path)
@@ -464,12 +448,9 @@ class ModelDownloadDialog(tk.Toplevel):
             self._cancel_flags[name].set()
 
     def _apply_and_close(self):
-        """모델 재로드 후 창 닫기"""
         if self._reload_cb:
             self._reload_cb()
         self.destroy()
-
-    # ── 큐 폴링 ──────────────────────────────────────
 
     def _poll(self):
         try:
@@ -539,31 +520,31 @@ class ZoomCanvas(tk.Canvas):
     마우스 휠 줌 + 드래그 패닝을 지원하는 이미지 캔버스.
     load_image(pil_img) 로 이미지를 로드.
     """
-    MIN_SCALE = 0.1
-    MAX_SCALE = 10.0
+    MIN_SCALE = 0.05
+    MAX_SCALE = 12.0
 
-    def __init__(self, parent, bg=CARD, **kw):
+    def __init__(self, parent, bg=CARD, label="", label_color=WHITE, **kw):
         super().__init__(parent, bg=bg, highlightthickness=0, **kw)
-        self._pil_orig  = None    # 원본 PIL 이미지
-        self._scale     = 1.0
-        self._offset_x  = 0
-        self._offset_y  = 0
-        self._drag_x    = 0
-        self._drag_y    = 0
-        self._tk_img    = None
+        self._pil_orig    = None
+        self._scale       = 1.0
+        self._offset_x    = 0
+        self._offset_y    = 0
+        self._drag_x      = 0
+        self._drag_y      = 0
+        self._tk_img      = None
+        self._label_text  = label
+        self._label_color = label_color
 
-        # 이벤트 바인딩
         self.bind("<Configure>",       self._on_configure)
         self.bind("<MouseWheel>",      self._on_wheel)
-        self.bind("<Button-4>",        self._on_wheel)   # Linux 위로
-        self.bind("<Button-5>",        self._on_wheel)   # Linux 아래로
+        self.bind("<Button-4>",        self._on_wheel)
+        self.bind("<Button-5>",        self._on_wheel)
         self.bind("<ButtonPress-1>",   self._on_drag_start)
         self.bind("<B1-Motion>",       self._on_drag_move)
         self.bind("<Double-Button-1>", self._reset_view)
-        self.bind("<ButtonPress-3>",   self._reset_view)  # 우클릭: 초기화
+        self.bind("<ButtonPress-3>",   self._reset_view)
 
     def load_image(self, pil_img: Image.Image):
-        """PIL 이미지를 로드하고 캔버스에 맞게 초기 배치"""
         self._pil_orig = pil_img
         self._fit_to_canvas()
 
@@ -571,15 +552,26 @@ class ZoomCanvas(tk.Canvas):
         self._pil_orig = None
         self.delete("all")
         self._tk_img = None
+        self._draw_empty()
+
+    def _draw_empty(self):
+        cw = self.winfo_width()
+        ch = self.winfo_height()
+        if cw > 10 and ch > 10:
+            self.create_text(
+                cw // 2, ch // 2,
+                text=self._label_text if self._label_text else "이미지 없음",
+                fill=TEXT2, font=("Segoe UI", 11), justify="center",
+                tags="hint"
+            )
 
     def _fit_to_canvas(self):
-        """이미지를 캔버스 크기에 맞게 자동 스케일"""
         if self._pil_orig is None:
             return
         cw = self.winfo_width()
         ch = self.winfo_height()
         if cw < 10 or ch < 10:
-            self.after(100, self._fit_to_canvas)
+            self.after(80, self._fit_to_canvas)
             return
 
         iw, ih = self._pil_orig.size
@@ -601,7 +593,6 @@ class ZoomCanvas(tk.Canvas):
         nw = max(1, int(iw * self._scale))
         nh = max(1, int(ih * self._scale))
 
-        # 리사이즈 (캔버스 크기를 넘지 않는 범위에서 LANCZOS)
         resized = self._pil_orig.resize((nw, nh), Image.LANCZOS)
         tk_img  = ImageTk.PhotoImage(resized)
 
@@ -610,27 +601,44 @@ class ZoomCanvas(tk.Canvas):
             int(self._offset_x), int(self._offset_y),
             anchor="nw", image=tk_img, tags="img"
         )
-        self._tk_img = tk_img  # 참조 유지 (GC 방지)
+        self._tk_img = tk_img
 
-        # 줌 레벨 표시
+        # 상단 레이블 (원본/복원 표시)
+        if self._label_text:
+            self.create_rectangle(0, 0, len(self._label_text)*8+20, 26,
+                                   fill="#00000088", outline="")
+            self.create_text(
+                10, 13,
+                text=self._label_text,
+                anchor="w", fill=self._label_color,
+                font=("Segoe UI", 10, "bold"), tags="title_lbl"
+            )
+
+        # 줌 레벨 표시 (우하단)
+        zoom_text = f"×{self._scale:.2f}  [더블클릭: 초기화]"
+        tw = len(zoom_text) * 7 + 10
+        self.create_rectangle(cw - tw - 4, ch - 24, cw - 2, ch - 2,
+                               fill="#00000066", outline="")
         self.create_text(
-            cw - 4, ch - 4,
-            text=f"×{self._scale:.2f}  [더블클릭: 원래 크기]",
+            cw - 6, ch - 6,
+            text=zoom_text,
             anchor="se", fill=TEXT2,
             font=("Consolas", 8), tags="zoom_lbl"
         )
 
     def _on_configure(self, event):
-        self._render()
+        if self._pil_orig is None:
+            self.delete("all")
+            self._draw_empty()
+        else:
+            self._render()
 
     def _on_wheel(self, event):
         if self._pil_orig is None:
             return
-        # 마우스 포인터 위치
         mx = self.canvasx(event.x)
         my = self.canvasy(event.y)
 
-        # 스케일 변화율
         if event.num == 4:
             factor = 1.15
         elif event.num == 5:
@@ -642,7 +650,6 @@ class ZoomCanvas(tk.Canvas):
                         min(self.MAX_SCALE, self._scale * factor))
         ratio = new_scale / self._scale
 
-        # 마우스 위치 기준으로 오프셋 조정 (줌 중심)
         self._offset_x = mx - ratio * (mx - self._offset_x)
         self._offset_y = my - ratio * (my - self._offset_y)
         self._scale    = new_scale
@@ -664,7 +671,6 @@ class ZoomCanvas(tk.Canvas):
         self._render()
 
     def _reset_view(self, event=None):
-        """더블클릭 또는 우클릭으로 초기 뷰 복원"""
         self._fit_to_canvas()
 
 
@@ -674,12 +680,10 @@ class ZoomCanvas(tk.Canvas):
 
 class DroneApp(tk.Tk):
 
-    # ── 초기화 ────────────────────────────────────────────
-
     def __init__(self):
         super().__init__()
-        self.title("🛸  Drone Shadow Remover & Color Restorer  v2.1")
-        self.geometry("1480x900")
+        self.title("🛸  Drone Shadow Remover & Color Restorer  v2.2")
+        self.geometry("1520x920")
         self.minsize(1200, 720)
         self.configure(bg=DARK)
         self._set_icon()
@@ -690,7 +694,7 @@ class DroneApp(tk.Tk):
         self.recursive_var  = tk.BooleanVar(value=False)
         self.save_compare   = tk.BooleanVar(value=True)
         self.overwrite_var  = tk.BooleanVar(value=False)
-        self.worker_var     = tk.IntVar(value=2)
+        self.worker_var     = tk.IntVar(value=1)  # 메모리 부족 방지: 기본 1
 
         self._file_list         = []
         self._selected_index    = -1
@@ -701,12 +705,11 @@ class DroneApp(tk.Tk):
         self._queue             = queue.Queue()
 
         # 현재 미리보기용 BGR 이미지
-        self._cur_orig   = None   # 원본 BGR
-        self._cur_result = None   # 복원 BGR
-        self._cur_binary = None   # 이진 마스크
-        self._cur_soft   = None   # 소프트 마스크
+        self._cur_orig   = None
+        self._cur_result = None
+        self._cur_binary = None
+        self._cur_soft   = None
 
-        # 모델 상태
         self._model_status = {}
 
         self._build_ui()
@@ -723,6 +726,7 @@ class DroneApp(tk.Tk):
 
     def _load_models_async(self):
         def _load():
+            gc.collect()
             base   = os.path.dirname(__file__)
             status = load_models(os.path.join(base, "models"))
             self._model_status = status
@@ -764,11 +768,11 @@ class DroneApp(tk.Tk):
         tk.Label(title_f, text="Drone Shadow Remover & Color Restorer",
                   bg=DARK3, fg=WHITE,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(title_f, text="v2.1  —  AI 모델 다운로드 + 단일 미리보기 + 줌/패닝 + 배치 처리",
+        tk.Label(title_f,
+                  text="v2.2  —  더블클릭 즉시 미리보기 + 원본/복원 나란히 비교 + 줌/패닝 + 배치 처리",
                   bg=DARK3, fg=TEXT2,
                   font=("Segoe UI", 9)).pack(anchor="w")
 
-        # 모델 다운로드 버튼
         FlatButton(hdr, "🤖  AI 모델 다운로드",
                     command=self._open_model_download,
                     bg="#2a6496", hover="#1d4f75",
@@ -780,7 +784,7 @@ class DroneApp(tk.Tk):
                                      font=("Segoe UI", 9))
         self.model_badge.pack(side="right", padx=8)
 
-    # ── 왼쪽 패널 : 폴더 선택 + 설정 ─────────────────────
+    # ── 왼쪽 패널 ────────────────────────────────────────
 
     def _build_left_panel(self, parent):
         frame = tk.Frame(parent, bg=DARK, width=290)
@@ -809,7 +813,7 @@ class DroneApp(tk.Tk):
 
         p = inner
 
-        # ── 폴더 선택 ─────────────────
+        # ── 폴더 선택
         self._section(p, "📁  폴더 설정")
         self._build_folder_section(p)
 
@@ -818,13 +822,15 @@ class DroneApp(tk.Tk):
         tw.pack(fill="x", padx=10, pady=2)
         tk.Label(tw, text="동시 처리 수", bg=DARK, fg=TEXT,
                   font=("Segoe UI", 9)).pack(side="left")
-        for v in (1,2,4):
+        for v in (1, 2, 4):
             tk.Radiobutton(tw, text=str(v), variable=self.worker_var,
                             value=v, bg=DARK, fg=TEXT2,
                             selectcolor=DARK3, activebackground=DARK,
                             font=("Segoe UI",9)).pack(side="left", padx=4)
+        tk.Label(tw, text="(메모리 부족 시 1 권장)", bg=DARK, fg=TEXT2,
+                  font=("Segoe UI",7)).pack(side="left", padx=2)
 
-        # ── 탐지 설정 ─────────────────
+        # ── 탐지 설정
         self._section(p, "🔍  그림자 탐지")
 
         self.detect_mode = tk.StringVar(value="hybrid")
@@ -839,7 +845,7 @@ class DroneApp(tk.Tk):
         self.sl_sensitivity = self._slider(p, "탐지 민감도", 0.1, 1.0, 0.5)
         self.sl_feather     = self._slider(p, "마스크 페더링", 5, 60, 25, fmt=".0f")
 
-        # ── 색상 복원 설정 ─────────────
+        # ── 색상 복원 설정
         self._section(p, "🎨  색상 복원")
 
         self.use_ai_color = tk.BooleanVar(value=True)
@@ -852,26 +858,25 @@ class DroneApp(tk.Tk):
         self.sl_color    = self._slider(p, "색 전달 강도",     0.0, 1.0, 0.65)
         self.sl_retinex  = self._slider(p, "Retinex 강도",    0.0, 0.6, 0.30)
 
-        # ── 선명화 설정 ──────────────
+        # ── 선명화 설정
         self._section(p, "✨  선명화 (복원 후)")
 
         self.sl_denoise  = self._slider(p, "노이즈 제거",      1, 15,  6, fmt=".0f")
         self.sl_sharpen  = self._slider(p, "선명도",          0.5, 3.0, 1.4)
         self.sl_clahe    = self._slider(p, "CLAHE 대비",      1.0, 5.0, 2.0)
 
-        # ── 실행 버튼 ────────────────
+        # ── 실행 버튼
         self._section(p, "")
 
-        # 1) 선택한 이미지 1장 미리 처리
+        # 미리보기 버튼
         self.btn_preview = FlatButton(p, "🔬  선택 이미지 미리보기",
                                        command=self._preview_selected,
                                        bg="#1a6b3a", hover="#0f4a28",
                                        width=260, height=36, font_size=10)
         self.btn_preview.pack(pady=(4,2), padx=10)
 
-        # 도움말
-        tk.Label(p, text="↑ 파일 목록에서 이미지를 선택 후 클릭",
-                  bg=DARK, fg=TEXT2, font=("Segoe UI",7)).pack(padx=12, anchor="w")
+        tk.Label(p, text="↑ 파일 목록 클릭 또는 더블클릭으로 즉시 처리",
+                  bg=DARK, fg=WARN, font=("Segoe UI",7)).pack(padx=12, anchor="w")
 
         ttk.Separator(p, orient="horizontal").pack(fill="x", padx=10, pady=6)
 
@@ -884,7 +889,6 @@ class DroneApp(tk.Tk):
                                     width=120, height=34, font_size=10)
         self.btn_scan.pack(side="left", padx=(0,6))
 
-        # 2) 전체 배치 처리
         self.btn_start = FlatButton(btn_f, "▶  전체 처리",
                                      command=self._start_processing,
                                      bg=ACCENT, hover="#5b4dd6",
@@ -908,9 +912,7 @@ class DroneApp(tk.Tk):
                 side="left", fill="x", expand=True, padx=6)
 
     def _build_folder_section(self, parent):
-        """폴더 설정 UI"""
-
-        # ── 입력 폴더 ──────────────────────────────────────
+        # 입력 폴더
         tk.Label(parent, text="📂  드론 사진 폴더", bg=DARK, fg=TEXT,
                   font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(6,2))
 
@@ -951,7 +953,7 @@ class DroneApp(tk.Tk):
                   text="예) C:\\Users\\이름\\드론사진  또는  /home/user/photos",
                   bg=DARK2, fg=TEXT2, font=("Segoe UI",7)).pack(anchor="w")
 
-        # ── 출력 폴더 ──────────────────────────────────────
+        # 출력 폴더
         tk.Label(parent, text="💾  저장 폴더", bg=DARK, fg=TEXT,
                   font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(8,2))
 
@@ -992,7 +994,7 @@ class DroneApp(tk.Tk):
                   text="예) C:\\Users\\이름\\출력폴더  (없으면 자동 생성)",
                   bg=DARK2, fg=TEXT2, font=("Segoe UI",7)).pack(anchor="w")
 
-        # ── 옵션 ───────────────────────────────────────────
+        # 옵션
         opts = tk.Frame(parent, bg=DARK)
         opts.pack(fill="x", padx=10, pady=(6,4))
         self._check(opts, "하위 폴더 포함 (재귀)",  self.recursive_var)
@@ -1023,7 +1025,7 @@ class DroneApp(tk.Tk):
                         activebackground=DARK,
                         font=("Segoe UI",9)).pack(anchor="w")
 
-    # ── 가운데 패널 : 줌 가능 미리보기 ──────────────────
+    # ── 가운데 패널 : 원본 + 복원 비교 ──────────────────
 
     def _build_center_panel(self, parent):
         frame = tk.Frame(parent, bg=DARK)
@@ -1031,67 +1033,71 @@ class DroneApp(tk.Tk):
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        # ── 탭 헤더 ────────────────────────────────────────
-        tab_f = tk.Frame(frame, bg=DARK2, height=40)
+        # ── 탭 헤더
+        tab_f = tk.Frame(frame, bg=DARK2, height=42)
         tab_f.grid(row=0, column=0, sticky="ew")
         tab_f.pack_propagate(False)
 
         self._tab_btns  = {}
         self._active_tab = tk.StringVar(value="compare")
 
-        for txt, key in [("비교 보기", "compare"), ("원본", "orig"), ("복원", "result")]:
+        for txt, key in [("🔄 비교 보기", "compare"), ("📷 원본", "orig"), ("✨ 복원", "result")]:
             b = tk.Label(tab_f, text=txt, bg=DARK2, fg=TEXT2,
-                          font=("Segoe UI",10), padx=18, pady=8, cursor="hand2")
+                          font=("Segoe UI",10), padx=14, pady=10, cursor="hand2")
             b.pack(side="left")
             b.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
             self._tab_btns[key] = b
 
-        # 줌 조작 힌트 (오른쪽)
-        tk.Label(tab_f, text="🔍 휠: 줌  |  드래그: 이동  |  더블클릭/우클릭: 원래크기",
-                  bg=DARK2, fg=TEXT2, font=("Segoe UI",8)).pack(side="right", padx=12)
+        tk.Label(tab_f,
+                  text="🔍 휠: 줌  │  드래그: 이동  │  더블클릭/우클릭: 초기화  │  파일목록 더블클릭: 즉시처리",
+                  bg=DARK2, fg=TEXT2, font=("Segoe UI",8)).pack(side="right", padx=10)
 
-        # ── 이미지 표시 영역 (탭 전환용) ──────────────────
-        # "compare" 탭: 나란히(원본|복원) 단일 ZoomCanvas
-        # "orig"    탭: ZoomCanvas (원본만)
-        # "result"  탭: ZoomCanvas (복원만)
-
+        # ── 이미지 표시 영역
         self._img_container = tk.Frame(frame, bg=CARD)
         self._img_container.grid(row=1, column=0, sticky="nsew", pady=(0,4))
-        self._img_container.rowconfigure(0, weight=1)
+        self._img_container.rowconfigure(0, weight=0)
+        self._img_container.rowconfigure(1, weight=1)
         self._img_container.columnconfigure(0, weight=1)
-        self._img_container.columnconfigure(1, weight=1)
+        self._img_container.columnconfigure(1, weight=0)   # 분할선
+        self._img_container.columnconfigure(2, weight=1)
 
-        # 단일 이미지용 ZoomCanvas (orig / result 탭)
-        self.zoom_canvas = ZoomCanvas(self._img_container, bg=CARD)
-        self.zoom_canvas.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        # 비교 탭 레이블 바
+        self._lbl_orig_bar = tk.Frame(self._img_container, bg="#1a2035", height=24)
+        tk.Label(self._lbl_orig_bar, text="  📷  원본 (Original)  ",
+                  bg="#1a2035", fg=ACC2,
+                  font=("Segoe UI",9,"bold")).pack(side="left", pady=2, padx=4)
+        tk.Label(self._lbl_orig_bar,
+                  text="휠:줌  드래그:이동  더블클릭:초기화",
+                  bg="#1a2035", fg=TEXT2,
+                  font=("Segoe UI",7)).pack(side="right", padx=8)
 
-        # 비교용: 왼쪽(원본) + 오른쪽(복원)
-        self.zoom_left  = ZoomCanvas(self._img_container, bg="#1a1a2e")
-        self.zoom_right = ZoomCanvas(self._img_container, bg="#1a2e1a")
+        self._lbl_result_bar = tk.Frame(self._img_container, bg="#1a2e1a", height=24)
+        tk.Label(self._lbl_result_bar, text="  ✨  복원 (Restored)  ",
+                  bg="#1a2e1a", fg=GREEN,
+                  font=("Segoe UI",9,"bold")).pack(side="left", pady=2, padx=4)
+        tk.Label(self._lbl_result_bar,
+                  text="휠:줌  드래그:이동  더블클릭:초기화",
+                  bg="#1a2e1a", fg=TEXT2,
+                  font=("Segoe UI",7)).pack(side="right", padx=8)
 
-        # 라벨 (비교 탭용)
-        self._lbl_orig_bar   = tk.Label(self._img_container, text="  원본  ",
-                                         bg="#1a1a2e", fg=ACC2,
-                                         font=("Segoe UI",9,"bold"))
-        self._lbl_result_bar = tk.Label(self._img_container, text="  복원  ",
-                                         bg="#1a2e1a", fg=GREEN,
-                                         font=("Segoe UI",9,"bold"))
+        # 분할선 (수직)
+        self._divider = tk.Frame(self._img_container, bg=ACCENT, width=2)
+
+        # ZoomCanvas 위젯 생성
+        self.zoom_canvas = ZoomCanvas(self._img_container, bg=CARD,
+                                       label="", label_color=TEXT2)
+        self.zoom_left   = ZoomCanvas(self._img_container, bg="#12122a",
+                                       label="📷 원본", label_color=ACC2)
+        self.zoom_right  = ZoomCanvas(self._img_container, bg="#0f1f0f",
+                                       label="✨ 복원", label_color=GREEN)
 
         # 초기 안내 텍스트
-        self.zoom_canvas.create_text(
-            400, 250,
-            text="📂  폴더 선택 → 파일 스캔 → 파일 클릭\n"
-                 "→  🔬 선택 이미지 미리보기  버튼으로 결과 확인\n\n"
-                 "결과가 마음에 들면  ▶ 전체 처리  버튼으로\n"
-                 "전체 이미지를 일괄 처리합니다",
-            fill=TEXT2, font=("Segoe UI", 12), justify="center",
-            tags="hint"
-        )
+        self.after(200, self._show_hint)
 
-        # 탭 초기화 (preview_canvas → zoom_canvas 로 변경 후 호출)
+        # 탭 초기화
         self._switch_tab("compare")
 
-        # ── 파일 리스트 (하단) ────────────────────────────
+        # ── 파일 리스트 (하단)
         list_f = tk.Frame(frame, bg=DARK2, height=130)
         list_f.grid(row=2, column=0, sticky="ew", pady=(4,0))
         list_f.pack_propagate(False)
@@ -1105,7 +1111,7 @@ class DroneApp(tk.Tk):
                                          font=("Segoe UI",8))
         self._file_count_lbl.pack(side="left")
         tk.Label(list_hdr,
-                  text="← 파일 클릭 후 [선택 이미지 미리보기] 버튼을 누르세요",
+                  text="← 클릭: 원본 보기  │  더블클릭: 즉시 그림자 제거+복원 처리",
                   bg=DARK2, fg=WARN, font=("Segoe UI",8)).pack(side="right", padx=8)
 
         list_scroll = ttk.Scrollbar(list_f, orient="vertical")
@@ -1118,6 +1124,26 @@ class DroneApp(tk.Tk):
         list_scroll.pack(side="right", fill="y")
         self.file_listbox.pack(fill="both", expand=True, padx=4)
         self.file_listbox.bind("<<ListboxSelect>>", self._on_file_select)
+        self.file_listbox.bind("<Double-Button-1>", self._on_file_double)
+
+    def _show_hint(self):
+        """초기 안내 텍스트 표시"""
+        if self._cur_orig is None:
+            for c in (self.zoom_canvas, self.zoom_left, self.zoom_right):
+                c.delete("all")
+            cw = self.zoom_canvas.winfo_width()
+            ch = self.zoom_canvas.winfo_height()
+            if cw > 50 and ch > 50:
+                self.zoom_canvas.create_text(
+                    cw // 2, ch // 2,
+                    text="📂 폴더 선택 → 파일 스캔 → 파일을 더블클릭\n"
+                         "또는 파일 클릭 후 [🔬 선택 이미지 미리보기] 클릭\n\n"
+                         "결과가 마음에 들면  ▶ 전체 처리  버튼으로\n"
+                         "전체 이미지를 일괄 처리합니다\n\n"
+                         "🔍 마우스 휠: 줌  │  드래그: 이동  │  더블클릭: 초기화",
+                    fill=TEXT2, font=("Segoe UI", 12), justify="center",
+                    tags="hint"
+                )
 
     def _switch_tab(self, key):
         self._active_tab.set(key)
@@ -1128,41 +1154,59 @@ class DroneApp(tk.Tk):
 
     def _apply_tab_layout(self, key):
         """탭 전환 시 캔버스 레이아웃 변경"""
-        # 모든 위젯 숨기기
         self.zoom_canvas.grid_remove()
         self.zoom_left.grid_remove()
         self.zoom_right.grid_remove()
         self._lbl_orig_bar.grid_remove()
         self._lbl_result_bar.grid_remove()
+        self._divider.grid_remove()
 
         if key == "compare":
-            # 라벨 + 좌우 캔버스
             self._lbl_orig_bar.grid(row=0, column=0, sticky="ew")
-            self._lbl_result_bar.grid(row=0, column=1, sticky="ew")
+            self._lbl_result_bar.grid(row=0, column=2, sticky="ew")
+            self._divider.grid(row=0, column=1, rowspan=2, sticky="ns")
             self.zoom_left.grid(row=1, column=0, sticky="nsew")
-            self.zoom_right.grid(row=1, column=1, sticky="nsew")
+            self.zoom_right.grid(row=1, column=2, sticky="nsew")
             self._img_container.rowconfigure(0, weight=0)
             self._img_container.rowconfigure(1, weight=1)
             # 이미지 적용
-            if self._cur_orig   is not None: self.zoom_left.load_image(cv2pil(self._cur_orig))
-            if self._cur_result is not None: self.zoom_right.load_image(cv2pil(self._cur_result))
+            if self._cur_orig is not None:
+                self.zoom_left.load_image(cv2pil(self._cur_orig))
+            else:
+                self.zoom_left.clear()
+            if self._cur_result is not None:
+                self.zoom_right.load_image(cv2pil(self._cur_result))
+            else:
+                self.zoom_right.clear()
         else:
             self._img_container.rowconfigure(0, weight=1)
             self._img_container.rowconfigure(1, weight=0)
-            self.zoom_canvas.grid(row=0, column=0, columnspan=2, sticky="nsew")
-            if key == "orig"   and self._cur_orig   is not None:
-                self.zoom_canvas.load_image(cv2pil(self._cur_orig))
-            elif key == "result" and self._cur_result is not None:
-                self.zoom_canvas.load_image(cv2pil(self._cur_result))
+            self.zoom_canvas.grid(row=0, column=0, columnspan=3, sticky="nsew")
+            if key == "orig":
+                if self._cur_orig is not None:
+                    self.zoom_canvas._label_text  = "📷 원본 (Original)"
+                    self.zoom_canvas._label_color = ACC2
+                    self.zoom_canvas.load_image(cv2pil(self._cur_orig))
+                else:
+                    self.zoom_canvas.clear()
+            elif key == "result":
+                if self._cur_result is not None:
+                    self.zoom_canvas._label_text  = "✨ 복원 (Restored)"
+                    self.zoom_canvas._label_color = GREEN
+                    self.zoom_canvas.load_image(cv2pil(self._cur_result))
+                else:
+                    self.zoom_canvas._label_text  = "복원 결과 없음"
+                    self.zoom_canvas._label_color = TEXT2
+                    self.zoom_canvas.clear()
 
-    # ── 오른쪽 패널 : 진행상황 + 통계 ───────────────────
+    # ── 오른쪽 패널 ──────────────────────────────────────
 
     def _build_right_panel(self, parent):
         frame = tk.Frame(parent, bg=DARK, width=320)
         frame.grid(row=0, column=2, sticky="nsew", padx=(8,0))
         frame.pack_propagate(False)
 
-        # ── 단일 처리 결과 정보 ───────────────────────────
+        # 단일 처리 결과
         self._section_plain(frame, "🔬  선택 이미지 처리 결과")
 
         self._preview_info_frame = tk.Frame(frame, bg=CARD, pady=8)
@@ -1185,16 +1229,15 @@ class DroneApp(tk.Tk):
                       font=("Segoe UI",9,"bold")).pack(side="right")
             self._preview_stat_vars[key] = v
 
-        # 처리 상태
         self._preview_status_lbl = tk.Label(
             self._preview_info_frame,
-            text="파일 선택 후 [선택 이미지 미리보기] 클릭",
+            text="파일 목록 더블클릭 또는\n[선택 이미지 미리보기] 클릭",
             bg=CARD, fg=TEXT2, font=("Segoe UI",8),
             wraplength=280, justify="left"
         )
         self._preview_status_lbl.pack(fill="x", padx=10, pady=(4,0))
 
-        # ── 배치 진행 상황 ───────────────────────────────
+        # 배치 진행
         self._section_plain(frame, "📊  전체 배치 처리 진행")
 
         pg_f = tk.Frame(frame, bg=CARD, pady=10)
@@ -1267,8 +1310,7 @@ class DroneApp(tk.Tk):
         ttk.Separator(f, orient="horizontal").pack(
             side="left", fill="x", expand=True, padx=6)
 
-    # ── 푸터 ───────────────────────────────────────────
-
+    # ── 푸터
     def _build_footer(self):
         ft = tk.Frame(self, bg=DARK3, height=28)
         ft.pack(fill="x", side="bottom")
@@ -1276,14 +1318,13 @@ class DroneApp(tk.Tk):
         self.status_lbl = tk.Label(ft, text="준비", bg=DARK3, fg=TEXT2,
                                     font=("Segoe UI",9), padx=12)
         self.status_lbl.pack(side="left", pady=4)
-        tk.Label(ft, text="Drone Shadow Remover v2.1  |  🤖 AI 모델 다운로드  |  🔬 선택 미리보기 → ▶ 전체 처리",
+        tk.Label(ft,
+                  text="v2.2  │  더블클릭: 즉시 미리보기  │  🔬 미리보기 → ▶ 전체 처리",
                   bg=DARK3, fg=TEXT2, font=("Segoe UI",8), padx=12).pack(side="right", pady=4)
 
     # ──────────────────────────────────────────────────────
     # 이벤트 핸들러
     # ──────────────────────────────────────────────────────
-
-    # ── 모델 다운로드 창 열기 ────────────────────────────
 
     def _open_model_download(self):
         model_dir = os.path.join(os.path.dirname(__file__), "models")
@@ -1295,7 +1336,6 @@ class DroneApp(tk.Tk):
         dlg.focus()
 
     def _reload_models(self):
-        """다운로드 후 모델을 메모리에 다시 로드"""
         self._set_status("모델 재로드 중…", WARN)
         self.model_badge.config(text="⏳ 재로딩…", fg=WARN)
         self._load_models_async()
@@ -1350,14 +1390,16 @@ class DroneApp(tk.Tk):
         self._log(f"📂 {folder}\n   → {len(files)}개 이미지 발견", "info")
 
         if files:
-            self._log("💡 파일 클릭 후 [🔬 선택 이미지 미리보기] 버튼을 눌러 결과를 확인하세요", "warn")
+            self._log("💡 파일을 더블클릭하면 즉시 그림자 제거+복원 처리됩니다", "warn")
 
     def _on_file_select(self, event):
-        """파일 목록에서 선택 시 원본만 로드"""
+        """파일 클릭: 원본 이미지 표시"""
         sel = self.file_listbox.curselection()
         if not sel:
             return
         idx  = sel[0]
+        if idx >= len(self._file_list):
+            return
         path = self._file_list[idx]
         self._selected_index = idx
         self._selected_path  = path
@@ -1366,28 +1408,42 @@ class DroneApp(tk.Tk):
             img = cv2.imread(path)
             if img is not None:
                 self._cur_orig   = img
+                # 복원 결과 초기화 (원본만 표시)
                 self._cur_result = None
                 self._cur_binary = None
                 self._cur_soft   = None
-                # 탭 갱신
-                self._apply_tab_layout(self._active_tab.get())
-                # 원본 탭으로 자동 전환
+                # 원본 탭으로 전환해서 표시
                 self._switch_tab("orig")
                 h, w = img.shape[:2]
-                self._set_status(f"선택: {os.path.basename(path)}  ({w}×{h})", ACC2)
+                self._set_status(f"선택: {os.path.basename(path)}  ({w}×{h})  │  더블클릭으로 즉시 처리", ACC2)
                 self._preview_status_lbl.config(
-                    text=f"선택: {os.path.basename(path)}\n[🔬 미리보기] 버튼으로 처리하세요",
+                    text=f"✔ 선택됨: {os.path.basename(path)}\n"
+                         f"크기: {w}×{h}\n\n"
+                         f"더블클릭 또는 [🔬 미리보기] 버튼으로\n그림자 제거+복원 처리",
                     fg=WARN
                 )
         except Exception as e:
             self._log(f"이미지 로드 실패: {e}", "error")
+
+    def _on_file_double(self, event):
+        """파일 더블클릭: 즉시 미리보기 처리"""
+        sel = self.file_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._file_list):
+            return
+        # 선택 상태 갱신
+        self._selected_index = idx
+        self._selected_path  = self._file_list[idx]
+        # 즉시 미리보기 실행
+        self._preview_selected()
 
     # ──────────────────────────────────────────────────────
     # 단일 이미지 미리보기 처리
     # ──────────────────────────────────────────────────────
 
     def _preview_selected(self):
-        """선택한 이미지 1장을 처리하고 결과를 미리보기"""
         if self._is_previewing:
             self._log("이미 처리 중입니다...", "warn")
             return
@@ -1399,8 +1455,9 @@ class DroneApp(tk.Tk):
 
         self._is_previewing = True
         self.btn_preview.set_enabled(False)
-        self._preview_status_lbl.config(text="⏳ 미리보기 처리 중 (최대 800px)...", fg=WARN)
-        self._set_status(f"미리보기 처리 중: {os.path.basename(self._selected_path)}", WARN)
+        self._preview_status_lbl.config(
+            text="⏳ 처리 중 (미리보기 모드: 800px)...\n잠시 기다려 주세요", fg=WARN)
+        self._set_status(f"처리 중: {os.path.basename(self._selected_path)}", WARN)
 
         params = self._collect_params()
         path   = self._selected_path
@@ -1411,7 +1468,6 @@ class DroneApp(tk.Tk):
                 self._queue.put(("preview_error", "이미지를 읽을 수 없습니다."))
                 return
             try:
-                h, w = img.shape[:2]
                 result, binary, soft, stats = process_single(
                     img,
                     detection_mode=params["detection_mode"],
@@ -1424,7 +1480,7 @@ class DroneApp(tk.Tk):
                     denoise_h=params["denoise_h"],
                     sharpen_amount=params["sharpen_amount"],
                     clahe_clip=params["clahe_clip"],
-                    preview_mode=True,   # ★ 고속 미리보기 모드 (최대 800px 축소 처리)
+                    preview_mode=True,
                 )
                 self._queue.put(("preview_done", img, result, binary, soft, stats,
                                  os.path.basename(path)))
@@ -1435,7 +1491,7 @@ class DroneApp(tk.Tk):
         threading.Thread(target=_work, daemon=True).start()
 
     # ──────────────────────────────────────────────────────
-    # 전체 배치 처리 시작 / 취소
+    # 전체 배치 처리
     # ──────────────────────────────────────────────────────
 
     def _start_processing(self):
@@ -1452,7 +1508,6 @@ class DroneApp(tk.Tk):
             messagebox.showwarning("경고", "출력 폴더를 지정하세요.")
             return
 
-        # 전체 처리 전 확인
         ans = messagebox.askyesno(
             "전체 처리 확인",
             f"총 {len(self._file_list)}개 이미지를 처리합니다.\n"
@@ -1471,7 +1526,6 @@ class DroneApp(tk.Tk):
         self.btn_cancel.set_enabled(True)
         self.btn_preview.set_enabled(False)
 
-        # 통계 초기화
         self._stat_vars["processed"].set("0")
         self._stat_vars["failed"].set("0")
         self._stat_vars["shadow_avg"].set("0.0 %")
@@ -1508,13 +1562,13 @@ class DroneApp(tk.Tk):
     # ──────────────────────────────────────────────────────
 
     def _run_batch(self, files, out_dir, params):
-        total      = len(files)
-        done       = 0
-        failed     = 0
+        total       = len(files)
+        done        = 0
+        failed      = 0
         shadow_list = []
         speed_list  = []
-        t_start    = time.time()
-        n_workers  = self.worker_var.get()
+        t_start     = time.time()
+        n_workers   = self.worker_var.get()
 
         self._queue.put(("progress", 0, total, "", ""))
 
@@ -1547,15 +1601,18 @@ class DroneApp(tk.Tk):
                     denoise_h=params["denoise_h"],
                     sharpen_amount=params["sharpen_amount"],
                     clahe_clip=params["clahe_clip"],
-                    preview_mode=False,  # ★ 배치: 원본 해상도 풀 처리
+                    preview_mode=False,
                 )
                 cv2.imwrite(out_path, result)
 
                 if self.save_compare.get():
                     cmp_path = os.path.join(out_dir, f"{stem}_compare.jpg")
                     cmp = make_compare(img, result, binary, soft)
-                    cv2.imwrite(cmp_path, cmp,
-                                [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    cv2.imwrite(cmp_path, cmp, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+                # 메모리 정리
+                del img
+                gc.collect()
 
                 return {
                     "status":   "ok",
@@ -1563,7 +1620,6 @@ class DroneApp(tk.Tk):
                     "fname":    fname,
                     "out_path": out_path,
                     "stats":    stats,
-                    "orig":     img,
                     "result":   result,
                 }
             except Exception as e:
@@ -1593,15 +1649,15 @@ class DroneApp(tk.Tk):
                     self._queue.put((
                         "progress", done, total,
                         r["fname"],
-                        f"✅ {r['fname']}  |  {stats['total_ms']}ms  |  그림자 {stats['shadow_pct']}%"
+                        f"✅ {r['fname']}  │  {stats['total_ms']}ms  │  그림자 {stats['shadow_pct']}%"
                     ))
                     self._queue.put(("stats_update",
                                       done, failed, avg_shadow, avg_speed, elapsed))
-                    self._queue.put(("batch_preview", r["orig"], r["result"]))
+                    self._queue.put(("batch_preview", None, r["result"]))
 
                 elif r["status"] == "skip":
                     self._queue.put(("progress", done, total, r["fname"],
-                                      f"⏭️ {r['fname']}  (이미 처리됨, 건너뜀)"))
+                                      f"⏭ {r['fname']}  (이미 처리됨, 건너뜀)"))
                 else:
                     failed += 1
                     self._queue.put(("progress", done, total, r["fname"],
@@ -1630,15 +1686,14 @@ class DroneApp(tk.Tk):
                     status = msg[1]
                     parts  = []
                     if status.get("shadow"): parts.append("탐지AI ✅")
-                    else:                    parts.append("탐지AI ❌(CV)")
+                    else:                    parts.append("탐지AI ❌(CV모드)")
                     if status.get("color"):  parts.append("색상AI ✅")
-                    else:                    parts.append("색상AI ❌(CV)")
-                    txt = "  |  ".join(parts)
+                    else:                    parts.append("색상AI ❌(CV모드)")
+                    txt = "  │  ".join(parts)
                     self.model_badge.config(text=txt, fg=GREEN)
-                    self._set_status("준비 완료 — 파일 스캔 후 이미지를 선택하세요", GREEN)
-                    self._log(f"모델 로드 완료: {txt}", "ok")
+                    self._set_status("준비 완료 — 폴더 선택 후 파일 스캔 → 더블클릭으로 즉시 미리보기", GREEN)
+                    self._log(f"모델 로드: {txt}", "ok")
 
-                # ── 단일 미리보기 결과 ─────────────────────
                 elif kind == "preview_done":
                     _, orig, result, binary, soft, stats, fname = msg
                     self._is_previewing = False
@@ -1649,7 +1704,7 @@ class DroneApp(tk.Tk):
                     self._cur_binary = binary
                     self._cur_soft   = soft
 
-                    # 비교 탭으로 전환
+                    # 비교 탭으로 전환 (원본+복원 나란히)
                     self._switch_tab("compare")
 
                     # 통계 업데이트
@@ -1663,17 +1718,21 @@ class DroneApp(tk.Tk):
                         f"{stats.get('total_ms', 0):.0f} ms")
                     self._preview_status_lbl.config(
                         text=f"✅ 처리 완료: {fname}\n"
-                             "결과가 마음에 들면 [▶ 전체 처리] 버튼을 클릭하세요",
+                             f"그림자 비율: {stats.get('shadow_pct',0):.1f}%\n"
+                             f"처리 시간: {stats.get('total_ms',0):.0f}ms\n\n"
+                             "결과가 마음에 들면\n[▶ 전체 처리] 버튼 클릭",
                         fg=GREEN
                     )
                     self._set_status(
-                        f"미리보기 완료: {fname}  |  그림자 {stats.get('shadow_pct',0):.1f}%  |  {stats.get('total_ms',0):.0f}ms",
+                        f"미리보기 완료: {fname}  │  그림자 {stats.get('shadow_pct',0):.1f}%  │  {stats.get('total_ms',0):.0f}ms",
                         GREEN
                     )
                     self._log(
                         f"🔬 미리보기 완료: {fname} | "
                         f"그림자 {stats.get('shadow_pct',0):.1f}% | "
-                        f"{stats.get('total_ms',0):.0f}ms",
+                        f"탐지 {stats.get('detection_ms',0):.0f}ms | "
+                        f"복원 {stats.get('restoration_ms',0):.0f}ms | "
+                        f"전체 {stats.get('total_ms',0):.0f}ms",
                         "ok"
                     )
 
@@ -1682,11 +1741,10 @@ class DroneApp(tk.Tk):
                     self._is_previewing = False
                     self.btn_preview.set_enabled(True)
                     self._preview_status_lbl.config(
-                        text=f"❌ 오류: {err[:80]}", fg=RED)
+                        text=f"❌ 오류: {err[:120]}", fg=RED)
                     self._set_status("미리보기 실패", RED)
                     self._log(f"❌ 미리보기 오류: {err}", "error")
 
-                # ── 배치 처리 ──────────────────────────────
                 elif kind == "progress":
                     _, done, total, fname, log_msg = msg
                     pct = int(done / total * 100) if total else 0
@@ -1694,8 +1752,8 @@ class DroneApp(tk.Tk):
                     self.prog_lbl.config(text=f"{done} / {total}  ({pct}%)")
                     self.cur_lbl.config(text=fname or "-")
                     if log_msg:
-                        tag = "ok" if log_msg.startswith("✅") else \
-                              "warn" if log_msg.startswith("⏭") else "error"
+                        tag = "ok"    if log_msg.startswith("✅") else \
+                              "warn"  if log_msg.startswith("⏭") else "error"
                         self._log(log_msg, tag)
 
                 elif kind == "stats_update":
@@ -1709,8 +1767,10 @@ class DroneApp(tk.Tk):
 
                 elif kind == "batch_preview":
                     _, orig, result = msg
-                    self._cur_orig   = orig
-                    self._cur_result = result
+                    if orig is not None:
+                        self._cur_orig = orig
+                    if result is not None:
+                        self._cur_result = result
                     self._apply_tab_layout(self._active_tab.get())
 
                 elif kind == "done":
@@ -1721,14 +1781,14 @@ class DroneApp(tk.Tk):
                     self.btn_preview.set_enabled(True)
                     m, s = divmod(int(elapsed), 60)
                     if cancelled:
-                        self._set_status(f"처리 중단  |  완료 {done}장", WARN)
+                        self._set_status(f"처리 중단  │  완료 {done}장", WARN)
                         self._log(f"⏹  중단됨  {done}장 처리  ({m:02d}:{s:02d})", "warn")
                     else:
                         self._set_status(
-                            f"🎉 완료!  {done}장 처리  |  실패 {failed}장  |  {m:02d}:{s:02d}",
+                            f"🎉 완료!  {done}장 처리  │  실패 {failed}장  │  {m:02d}:{s:02d}",
                             GREEN)
                         self._log(
-                            f"🎉 완료! 총 {done}장  |  실패 {failed}장  |  {m:02d}:{s:02d}",
+                            f"🎉 완료! 총 {done}장  │  실패 {failed}장  │  {m:02d}:{s:02d}",
                             "ok")
                     self.cur_lbl.config(text="-")
 
@@ -1756,6 +1816,7 @@ class DroneApp(tk.Tk):
 # ──────────────────────────────────────────────────────────
 
 def main():
+    # Windows DPI 인식
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
