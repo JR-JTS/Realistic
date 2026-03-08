@@ -282,15 +282,7 @@ class DroneApp(tk.Tk):
 
         # ── 폴더 선택 ─────────────────
         self._section(p, "📁  폴더 설정")
-
-        self._folder_row(p, "입력 폴더",  self.input_folder,  self._browse_input)
-        self._folder_row(p, "출력 폴더",  self.output_folder, self._browse_output)
-
-        opts = tk.Frame(p, bg=DARK)
-        opts.pack(fill="x", padx=10, pady=4)
-        self._check(opts, "하위 폴더 포함 (재귀)",  self.recursive_var)
-        self._check(opts, "비교 이미지 저장",       self.save_compare)
-        self._check(opts, "기존 파일 덮어쓰기",     self.overwrite_var)
+        self._build_folder_section(p)
 
         # 처리 쓰레드 수
         tw = tk.Frame(p, bg=DARK)
@@ -372,17 +364,116 @@ class DroneApp(tk.Tk):
             ttk.Separator(f, orient="horizontal").pack(
                 side="left", fill="x", expand=True, padx=6)
 
-    def _folder_row(self, parent, label, var, cmd):
-        f = tk.Frame(parent, bg=DARK)
-        f.pack(fill="x", padx=10, pady=3)
-        tk.Label(f, text=label, bg=DARK, fg=TEXT2,
-                  font=("Segoe UI",9), width=8, anchor="w").pack(side="left")
-        tk.Entry(f, textvariable=var, bg=DARK2, fg=TEXT,
-                  insertbackground=WHITE, relief="flat",
-                  font=("Segoe UI",9)).pack(side="left", fill="x", expand=True, padx=4)
-        FlatButton(f, "찾기", command=cmd,
+    def _build_folder_section(self, parent):
+        """폴더 설정 UI – 큰 버튼 + 경로 표시 + 직접 입력 토글"""
+
+        # ── 입력 폴더 ──────────────────────────────────────
+        tk.Label(parent, text="📂  드론 사진 폴더", bg=DARK, fg=TEXT,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(6,2))
+
+        in_card = tk.Frame(parent, bg=DARK2, padx=8, pady=8)
+        in_card.pack(fill="x", padx=10, pady=(0,4))
+
+        # 경로 표시 라벨
+        self._in_path_lbl = tk.Label(
+            in_card, textvariable=self.input_folder,
+            bg=DARK2, fg=ACC2,
+            font=("Consolas", 8), wraplength=220, justify="left", anchor="w"
+        )
+        self._in_path_lbl.pack(fill="x")
+        # 경로 없을 때 안내 텍스트
+        self.input_folder.trace_add("write", lambda *_: self._update_path_label(
+            self._in_path_lbl, self.input_folder, "← 아래 버튼으로 폴더를 선택하세요"))
+        self._update_path_label(self._in_path_lbl, self.input_folder, "← 아래 버튼으로 폴더를 선택하세요")
+
+        btn_row_in = tk.Frame(in_card, bg=DARK2)
+        btn_row_in.pack(fill="x", pady=(6,0))
+        FlatButton(btn_row_in, "📂  폴더 선택",
+                    command=self._browse_input,
+                    bg=ACCENT, hover="#5b4dd6",
+                    width=140, height=30, font_size=9
+        ).pack(side="left", padx=(0,6))
+        FlatButton(btn_row_in, "✏ 직접 입력",
+                    command=lambda: self._toggle_direct_input("input"),
                     bg=DARK3, hover=DARK2, fg=TEXT2,
-                    width=50, height=26, font_size=9).pack(side="right", padx=(4,0))
+                    width=90, height=30, font_size=9
+        ).pack(side="left")
+
+        # 직접 입력 Entry (기본 숨김)
+        self._in_entry_frame = tk.Frame(in_card, bg=DARK2)
+        tk.Entry(self._in_entry_frame,
+                  textvariable=self.input_folder,
+                  bg="#1a1a30", fg=ACC2,
+                  insertbackground=WHITE, relief="flat",
+                  font=("Consolas", 9)
+        ).pack(fill="x", pady=(4,0), ipady=4)
+        tk.Label(self._in_entry_frame,
+                  text="예) C:\\Users\\이름\\드론사진  또는  /home/user/photos",
+                  bg=DARK2, fg=TEXT2, font=("Segoe UI",7)).pack(anchor="w")
+
+        # ── 출력 폴더 ──────────────────────────────────────
+        tk.Label(parent, text="💾  저장 폴더", bg=DARK, fg=TEXT,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(8,2))
+
+        out_card = tk.Frame(parent, bg=DARK2, padx=8, pady=8)
+        out_card.pack(fill="x", padx=10, pady=(0,4))
+
+        self._out_path_lbl = tk.Label(
+            out_card, textvariable=self.output_folder,
+            bg=DARK2, fg=GREEN,
+            font=("Consolas", 8), wraplength=220, justify="left", anchor="w"
+        )
+        self._out_path_lbl.pack(fill="x")
+        self.output_folder.trace_add("write", lambda *_: self._update_path_label(
+            self._out_path_lbl, self.output_folder, "← 입력 폴더 선택 시 자동 설정"))
+        self._update_path_label(self._out_path_lbl, self.output_folder, "← 입력 폴더 선택 시 자동 설정")
+
+        btn_row_out = tk.Frame(out_card, bg=DARK2)
+        btn_row_out.pack(fill="x", pady=(6,0))
+        FlatButton(btn_row_out, "💾  폴더 선택",
+                    command=self._browse_output,
+                    bg="#2a6496", hover="#1d4f75",
+                    width=140, height=30, font_size=9
+        ).pack(side="left", padx=(0,6))
+        FlatButton(btn_row_out, "✏ 직접 입력",
+                    command=lambda: self._toggle_direct_input("output"),
+                    bg=DARK3, hover=DARK2, fg=TEXT2,
+                    width=90, height=30, font_size=9
+        ).pack(side="left")
+
+        self._out_entry_frame = tk.Frame(out_card, bg=DARK2)
+        tk.Entry(self._out_entry_frame,
+                  textvariable=self.output_folder,
+                  bg="#1a1a30", fg=GREEN,
+                  insertbackground=WHITE, relief="flat",
+                  font=("Consolas", 9)
+        ).pack(fill="x", pady=(4,0), ipady=4)
+        tk.Label(self._out_entry_frame,
+                  text="예) C:\\Users\\이름\\출력폴더  (없으면 자동 생성)",
+                  bg=DARK2, fg=TEXT2, font=("Segoe UI",7)).pack(anchor="w")
+
+        # ── 옵션 ───────────────────────────────────────────
+        opts = tk.Frame(parent, bg=DARK)
+        opts.pack(fill="x", padx=10, pady=(6,4))
+        self._check(opts, "하위 폴더 포함 (재귀)",  self.recursive_var)
+        self._check(opts, "비교 이미지 저장",       self.save_compare)
+        self._check(opts, "기존 파일 덮어쓰기",     self.overwrite_var)
+
+    def _update_path_label(self, lbl, var, placeholder):
+        """경로가 비어 있으면 안내 텍스트, 있으면 색상 강조"""
+        v = var.get()
+        if not v:
+            lbl.config(text=placeholder, fg=TEXT2)
+        # textvariable이 이미 연결되어 있으므로 text 덮어쓰기 방지
+        # (trace 콜백에서 placeholder만 처리)
+
+    def _toggle_direct_input(self, which):
+        """직접 입력 Entry 토글 표시/숨김"""
+        frame = self._in_entry_frame if which == "input" else self._out_entry_frame
+        if frame.winfo_ismapped():
+            frame.pack_forget()
+        else:
+            frame.pack(fill="x", pady=(4,0))
 
     def _slider(self, parent, label, lo, hi, init, fmt=".2f"):
         s = LabeledSlider(parent, label, lo, hi, init,
@@ -598,17 +689,35 @@ class DroneApp(tk.Tk):
     # ──────────────────────────────────────────────────────
 
     def _browse_input(self):
-        d = filedialog.askdirectory(title="입력 폴더 선택")
+        # initialdir: 현재 설정된 경로 또는 홈 디렉터리
+        init = self.input_folder.get().strip()
+        if not init or not os.path.isdir(init):
+            init = os.path.expanduser("~")
+        d = filedialog.askdirectory(
+            title="드론 사진이 있는 폴더를 선택하세요",
+            initialdir=init,
+        )
         if d:
+            # Windows 경로 정규화 (슬래시 → 백슬래시)
+            d = os.path.normpath(d)
             self.input_folder.set(d)
             # 출력 폴더 자동 설정
             if not self.output_folder.get():
-                self.output_folder.set(os.path.join(d, "output"))
+                self.output_folder.set(os.path.join(d, "output_restored"))
+            self._log(f"📂 입력 폴더: {d}", "info")
 
     def _browse_output(self):
-        d = filedialog.askdirectory(title="출력 폴더 선택")
+        init = self.output_folder.get().strip()
+        if not init or not os.path.isdir(init):
+            init = self.input_folder.get().strip() or os.path.expanduser("~")
+        d = filedialog.askdirectory(
+            title="결과를 저장할 폴더를 선택하세요",
+            initialdir=init,
+        )
         if d:
+            d = os.path.normpath(d)
             self.output_folder.set(d)
+            self._log(f"💾 출력 폴더: {d}", "info")
 
     def _scan_files(self):
         folder = self.input_folder.get().strip()
