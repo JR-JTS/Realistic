@@ -1,14 +1,16 @@
 """
 Drone Shadow Remover & Color Restorer
-Desktop Application  –  Tkinter GUI  v1.71
+Desktop Application  –  Tkinter GUI  v1.73
 ────────────────────────────────────────
 실행: python main.py
 
-v1.71 수정 사항:
-  • Shadow / Highlight 슬라이더: 0~100 퍼센트 단위 (0=원본, 100=최대 복원)
-  • 이미지별 통계 자동 분석 — 하드코딩 없이 적응형 gain 계산
-  • 사진마다 다른 그림자 특성에 맞게 자동 보정
-  • 버전 표기 v1.71로 통일
+v1.73 수정 사항:
+  • 슬라이더 라벨 단순화 — 값만 표시, 부연설명 제거
+  • 탐지 옵션(민감도/페더링) → 고급 옵션으로 접힘
+  • 색상복원 모드 추가 — Gain / Retinex / WB / Gamma
+  • 드래그(패닝) 후 즉시 재처리 (뷰 유지)
+  • 슬라이더 조정 시 전체화면 전환 없이 현재 뷰 유지
+  • AI 과도 적용 추가 개선 (블렌딩 0.15 이하 제한)
 """
 
 import tkinter as tk
@@ -22,6 +24,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Tuple, Dict, List
 import gc
 
 import cv2
@@ -32,7 +35,7 @@ from PIL import Image, ImageTk
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from pipeline import (
     load_models, process_single, scan_folder,
-    scan_folder_recursive, make_compare, SUPPORTED_EXT
+    scan_folder_recursive, SUPPORTED_EXT, copy_exif
 )
 
 # ──────────────────────────────────────────────────────────
@@ -429,6 +432,8 @@ class ZoomCanvas(tk.Canvas):
         self._label_color    = label_color
         self._render_pending = False
         self._dragging       = False
+        self._pan_callback   = None   # 패닝 완료 콜백
+        self._sync_targets   = []     # 동기화할 다른 ZoomCanvas 목록
 
         self.bind("<Configure>",      self._on_configure)
         self.bind("<MouseWheel>",     self._on_wheel)
@@ -444,8 +449,27 @@ class ZoomCanvas(tk.Canvas):
     # ──────────────────────────────────────────────────────
     # 공개 API
 
-    def load_image(self, pil_img: Image.Image):
-        """PIL 이미지를 로드하고 캔버스에 맞게 표시"""
+    def load_image(self, pil_img: Image.Image, keep_view: bool = False):
+        """PIL 이미지를 로드하고 캔버스에 맞게 표시.
+        keep_view=True: 현재 zoom/pan 위치 유지 (슬라이더 재처리 시 사용)
+        keep_view=False: 캔버스에 맞게 초기화 (첫 로드 또는 파일 전환 시)
+        """
+        if keep_view and self._pil_orig is not None:
+            # 현재 이미지 크기 저장 (교체 전)
+            old_size = self._pil_orig.size  # (w, h)
+            new_size = pil_img.size
+            # 현재 뷰(scale, offset) 저장
+            saved_scale    = self._scale
+            saved_offset_x = self._offset_x
+            saved_offset_y = self._offset_y
+            self._pil_orig = pil_img
+            if old_size == new_size:
+                # 같은 크기 → 뷰 복원, 재렌더링만
+                self._scale    = saved_scale
+                self._offset_x = saved_offset_x
+                self._offset_y = saved_offset_y
+                self._do_render()
+                return
         self._pil_orig = pil_img
         self._fit_to_canvas()
 
@@ -525,8 +549,9 @@ class ZoomCanvas(tk.Canvas):
         dst_w  = max(1, int((img_x1 - img_x0) * sc))
         dst_h  = max(1, int((img_y1 - img_y0) * sc))
 
-        # 리샘플링 선택: 축소=BILINEAR (품질), 확대=NEAREST (속도)
-        resample = Image.BILINEAR if sc < 1.0 else Image.NEAREST
+        # 리샘플링: 항상 BILINEAR (축소/확대 모두 품질 우선)
+        # 원본 해상도 그대로 처리된 이미지이므로 확대 시에도 선명하게 표시
+        resample = Image.BILINEAR
         resized  = crop.resize((dst_w, dst_h), resample)
 
         # 캔버스에서의 그리기 위치
@@ -585,6 +610,7 @@ class ZoomCanvas(tk.Canvas):
         self._offset_y = my - ratio * (my - self._offset_y)
         self._scale    = new_scale
         self._schedule_render()
+        self._sync_view_to_targets()
 
     def _on_drag_start(self, event):
         self._drag_x  = event.x
@@ -604,12 +630,28 @@ class ZoomCanvas(tk.Canvas):
         if not self._render_pending:
             self._render_pending = True
             self.after(0, self._do_render)
+        self._sync_view_to_targets()
 
     def _on_drag_end(self, event):
         self._dragging = False
+        # 패닝 완료 → 콜백 호출 (재처리 트리거)
+        if self._pan_callback is not None:
+            try: self._pan_callback()
+            except Exception: pass
 
     def _reset_view(self, event=None):
         self._fit_to_canvas()
+        self._sync_view_to_targets()
+
+    def _sync_view_to_targets(self):
+        """현재 scale/offset을 동기화 대상 캔버스에 복사하고 재렌더."""
+        for other in self._sync_targets:
+            if other is self or other._pil_orig is None:
+                continue
+            other._scale    = self._scale
+            other._offset_x = self._offset_x
+            other._offset_y = self._offset_y
+            other._schedule_render()
 
     def get_viewport_image_rect(self) -> Optional[Tuple[int,int,int,int]]:
         """
@@ -641,17 +683,23 @@ class DroneApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Drone Shadow Remover & Color Restorer  v1.71")
+        self.title("Drone Shadow Remover & Color Restorer  v1.73")
         self.geometry("1560x960")
         self.minsize(1200, 720)
         self.configure(bg=DARK)
         self._set_icon()
 
+        # ── 앱 기본 폴더 (실행 파일 기준 uploads / outputs)
+        _base = os.path.dirname(os.path.abspath(__file__))
+        _default_input  = os.path.join(_base, "uploads")
+        _default_output = os.path.join(_base, "outputs")
+        os.makedirs(_default_input,  exist_ok=True)
+        os.makedirs(_default_output, exist_ok=True)
+
         # ── 상태 변수
-        self.input_folder  = tk.StringVar(value="")
-        self.output_folder = tk.StringVar(value="")
+        self.input_folder  = tk.StringVar(value=_default_input)
+        self.output_folder = tk.StringVar(value=_default_output)
         self.recursive_var = tk.BooleanVar(value=False)
-        self.save_compare  = tk.BooleanVar(value=True)
         self.overwrite_var = tk.BooleanVar(value=False)
         self.worker_var    = tk.IntVar(value=1)
 
@@ -672,9 +720,21 @@ class DroneApp(tk.Tk):
 
         self._model_status = {}
 
+        self._preview_tab_lock = "compare"  # 처리 전 탭 기억
+        self._first_load_done  = False        # 첫 파일 로드 여부
+
         self._build_ui()
+        # 패닝 완료 콜백 등록 (zoom 캔버스 생성 후)
+        self.zoom_right._pan_callback  = self._on_pan_done
+        self.zoom_single._pan_callback = self._on_pan_done
+        self.zoom_left._pan_callback   = self._on_pan_done
+        # ── Compare 탭: 왼쪽(원본)↔오른쪽(복원) 양방향 뷰 동기화
+        self.zoom_left._sync_targets  = [self.zoom_right]
+        self.zoom_right._sync_targets = [self.zoom_left]
         self._load_models_async()
         self._poll_queue()
+        # 시작 후 500ms 뒤 uploads/ 자동 스캔 + 첫 파일 자동 처리
+        self.after(500, self._auto_startup)
 
     def _set_icon(self):
         try: self.iconbitmap("")
@@ -692,6 +752,50 @@ class DroneApp(tk.Tk):
             self._queue.put(("model_loaded", status))
         threading.Thread(target=_load, daemon=True).start()
         self._set_status("모델 로딩 중...", WARN)
+
+    def _auto_startup(self):
+        """앱 시작 시 uploads/ 폴더 자동 스캔 + 첫 파일 자동 처리."""
+        folder = self.input_folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            return
+
+        # 파일 스캔
+        files = scan_folder(folder)
+        if not files:
+            self._log(f"uploads/ 폴더에 이미지 없음 — 파일을 추가하세요.", "warn")
+            self._set_status("uploads/ 폴더에 이미지를 추가하세요.", WARN)
+            return
+
+        self._file_list = files
+        self.file_listbox.delete(0, "end")
+        for f in files:
+            self.file_listbox.insert("end", os.path.basename(f))
+        self._stat_vars["total_files"].set(str(len(files)))
+        self._cnt_lbl.config(text=f"({len(files)}개)")
+        self._log(f"자동 스캔: uploads/ → {len(files)}개 파일 발견", "ok")
+
+        # 첫 번째 파일 선택 + 자동 처리
+        self.file_listbox.selection_set(0)
+        self.file_listbox.activate(0)
+        self._selected_idx  = 0
+        self._selected_path = files[0]
+
+        img = safe_imread(files[0])
+        if img is None:
+            self._log(f"❌ 첫 파일 로드 실패: {os.path.basename(files[0])}", "error")
+            return
+
+        self._cur_orig   = img
+        self._cur_result = None
+        self._cur_binary = None
+        self._cur_soft   = None
+        self._first_load_done = False  # 시작 파일 → compare 탭으로 이동
+
+        h, w = img.shape[:2]
+        self._set_status(f"자동 처리 시작: {os.path.basename(files[0])}  ({w}×{h})", WARN)
+        self._log(f"첫 파일 자동 처리: {os.path.basename(files[0])}", "info")
+        # 200ms 뒤 처리 시작 (UI 초기화 완료 대기)
+        self.after(200, self._live_preview_roi)
 
     # ──────────────────────────────────────────────────────
     # UI 빌드
@@ -717,10 +821,10 @@ class DroneApp(tk.Tk):
 
         left = tk.Frame(hdr, bg=DARK3)
         left.pack(side="left", padx=16)
-        tk.Label(left, text="Drone Shadow Remover  v1.71", bg=DARK3, fg=WHITE,
+        tk.Label(left, text="Drone Shadow Remover  v1.73", bg=DARK3, fg=WHITE,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         tk.Label(left,
-                  text="v1.71  |  클릭:원본  |  더블클릭:즉시처리  |  슬라이더 조정 후 미리보기 버튼으로 재처리",
+                  text="v1.74  |  클릭:원본  |  더블클릭:즉시처리  |  슬라이더 조정 → 즉시 재처리",
                   bg=DARK3, fg=TEXT2, font=("Segoe UI", 9)).pack(anchor="w")
 
         FlatButton(hdr, "AI 모델 다운로드", command=self._open_model_download,
@@ -792,73 +896,75 @@ class DroneApp(tk.Tk):
                             bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                             font=("Segoe UI", 9)).pack(side="left", padx=5)
 
-        self.sl_sensitivity = self._slider(p, "탐지 민감도",   0.1, 1.0, 0.45)
-        self.sl_feather     = self._slider(p, "마스크 페더링", 3,   50,  20, fmt=".0f")
+        # ── 고급 탐지 옵션 (접기/펼치기)
+        self._adv_detect_open = tk.BooleanVar(value=False)
+        adv_hdr = tk.Frame(p, bg=DARK)
+        adv_hdr.pack(fill="x", padx=10, pady=(2, 0))
+        self._adv_detect_btn = tk.Label(
+            adv_hdr, text="▶ 고급 탐지 옵션",
+            bg=DARK, fg=TEXT2, font=("Segoe UI", 8), cursor="hand2")
+        self._adv_detect_btn.pack(side="left")
+        self._adv_detect_btn.bind("<Button-1>", self._toggle_adv_detect)
+        self._adv_detect_frame = tk.Frame(p, bg=DARK)
+        self.sl_sensitivity = self._slider(self._adv_detect_frame, "탐지 민감도", 0.1, 1.0, 0.45)
+        self.sl_feather     = self._slider(self._adv_detect_frame, "마스크 페더링", 3, 50, 20, fmt=".0f")
 
-        # ── 색상 복원 설정 (v1.71 Shadow / Highlight 분리 + 적응형 분석)
-        self._section(p, "Shadow  (그림자 밝게 + 색상 복원)")
+        # ── 색상 복원 설정 (v1.72 Shadow / Highlight)
+        self._section(p, "Shadow  (그림자 복원)")
         self.use_ai_color = tk.BooleanVar(value=True)
-        tk.Checkbutton(p, text="AI 미세 보정 (모델 로드 시 활성)",
+        tk.Checkbutton(p, text="AI 미세 보정 (모델 로드 시)",
                         variable=self.use_ai_color,
                         command=self._on_param_change,
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
         self.use_hue_consist = tk.BooleanVar(value=True)
-        tk.Checkbutton(p, text="Hue 기반 정밀 색상 복원 (권장)",
+        tk.Checkbutton(p, text="Hue 정밀 복원 (권장)",
                         variable=self.use_hue_consist,
                         command=self._on_param_change,
                         bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
                         font=("Segoe UI", 9)).pack(anchor="w", padx=12)
 
-        # Shadow: 0=원본, 100=완전복원 (%)
-        self.sl_shadow   = self._slider(p, "Shadow  0=원본 / 100=완전복원 (%)",
-                                         0, 100, 85, fmt=".0f")
+        # 색상복원 모드 선택
+        cm_f = tk.Frame(p, bg=DARK)
+        cm_f.pack(fill="x", padx=10, pady=(4, 0))
+        tk.Label(cm_f, text="복원 모드:", bg=DARK, fg=TEXT2,
+                  font=("Segoe UI", 8)).pack(side="left")
+        self.color_mode = tk.StringVar(value="gain")
+        for txt, val in [("Gain", "gain"), ("Retinex", "retinex"),
+                          ("WB", "wb"), ("Gamma", "gamma")]:
+            tk.Radiobutton(cm_f, text=txt, variable=self.color_mode, value=val,
+                            bg=DARK, fg=TEXT2, selectcolor=DARK3,
+                            activebackground=DARK, font=("Segoe UI", 8),
+                            command=self._on_param_change).pack(side="left", padx=3)
+
+        # Shadow 슬라이더
+        self.sl_shadow = self._slider(p, "Shadow", 0, 100, 85, fmt=".0f")
         self._bind_slider_live(self.sl_shadow)
 
-        self._section(p, "Highlight  (밝은 영역 텍스처 복원)")
-        # Highlight: 0=원본, 100=최대 복원 (%)
-        self.sl_highlight = self._slider(p, "Highlight  0=원본 / 100=최대 (%)",
-                                          0, 100, 30, fmt=".0f")
+        self._section(p, "Highlight  (밝은 영역 복원)")
+        self.sl_highlight = self._slider(p, "Highlight", 0, 100, 30, fmt=".0f")
         self._bind_slider_live(self.sl_highlight)
 
         # ── 영상 품질 개선
         self._section(p, "영상 품질 개선")
-        self.sl_denoise = self._slider(p, "노이즈 제거",     1,   12,  4,   fmt=".0f")
-        self.sl_sharpen = self._slider(p, "선명도",          0.0, 2.0, 0.7)
-        self.sl_clahe   = self._slider(p, "CLAHE 로컬대비",  0.5, 4.0, 2.0)
+        self.sl_denoise = self._slider(p, "노이즈 제거",  1,   12,  4,   fmt=".0f")
+        self.sl_sharpen = self._slider(p, "선명도",       0.0, 2.0, 0.7)
+        self.sl_clahe   = self._slider(p, "CLAHE",        0.5, 4.0, 2.0)
         self._bind_slider_live(self.sl_denoise)
         self._bind_slider_live(self.sl_sharpen)
         self._bind_slider_live(self.sl_clahe)
 
         # 슬라이더 실시간 딜레이 (ms)
-        self._live_delay_ms = 600   # 마지막 조작 후 600ms 뒤 자동 미리보기
-        self._live_timer_id = None  # after() ID
-        self._live_roi_mode = True  # True=보이는영역만, False=전체
+        self._live_delay_ms = 300
+        self._live_timer_id = None
+        self._live_roi_var  = tk.BooleanVar(value=True)  # 항상 True (내부용)
 
         # ── 실행 버튼
         self._section(p, "")
 
-        # 실시간/ROI 모드 토글
-        self._live_roi_var = tk.BooleanVar(value=True)
-        roi_row = tk.Frame(p, bg=DARK)
-        roi_row.pack(fill="x", padx=10, pady=(2,0))
-        tk.Checkbutton(roi_row, text="슬라이더 실시간 미리보기",
-                        variable=self._live_roi_var,
-                        bg=DARK, fg=TEXT, selectcolor=DARK3, activebackground=DARK,
-                        font=("Segoe UI", 8)).pack(side="left")
-        tk.Label(roi_row, text="(보이는영역만)", bg=DARK, fg=TEXT2,
-                  font=("Segoe UI", 7)).pack(side="left", padx=2)
-
-        self.btn_preview = FlatButton(
-            p, "선택 이미지 미리보기 (재처리)",
-            command=self._preview_selected,
-            bg="#1a6b3a", hover="#0f4a28",
-            width=250, height=36, font_size=10)
-        self.btn_preview.pack(pady=(4, 2), padx=10)
-
         tk.Label(p,
-                  text="더블클릭=즉시처리  |  슬라이더 조정 시 자동 실시간 반영",
-                  bg=DARK, fg=WARN, font=("Segoe UI", 7)).pack(padx=12, anchor="w")
+                  text="파일 클릭 → 즉시 처리  |  슬라이더 → 300ms 후 자동 반영  |  패닝 후 자동 반영",
+                  bg=DARK, fg=WARN, font=("Segoe UI", 7)).pack(padx=12, anchor="w", pady=(4,2))
 
         ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=6)
 
@@ -920,8 +1026,8 @@ class DroneApp(tk.Tk):
                                       wraplength=230, justify="left", anchor="w")
         self._in_path_lbl.pack(fill="x")
         self.input_folder.trace_add("write", lambda *_: self._upd_path_lbl(
-            self._in_path_lbl, self.input_folder, "버튼으로 폴더 선택"))
-        self._upd_path_lbl(self._in_path_lbl, self.input_folder, "버튼으로 폴더 선택")
+            self._in_path_lbl, self.input_folder, "uploads/ 기본 폴더 사용 중"))
+        self._upd_path_lbl(self._in_path_lbl, self.input_folder, "uploads/ 기본 폴더 사용 중")
 
         br = tk.Frame(in_card, bg=DARK2)
         br.pack(fill="x", pady=(4, 0))
@@ -948,8 +1054,8 @@ class DroneApp(tk.Tk):
                                        wraplength=230, justify="left", anchor="w")
         self._out_path_lbl.pack(fill="x")
         self.output_folder.trace_add("write", lambda *_: self._upd_path_lbl(
-            self._out_path_lbl, self.output_folder, "입력 폴더 선택 시 자동 설정"))
-        self._upd_path_lbl(self._out_path_lbl, self.output_folder, "입력 폴더 선택 시 자동 설정")
+            self._out_path_lbl, self.output_folder, "outputs/ 기본 폴더 사용 중"))
+        self._upd_path_lbl(self._out_path_lbl, self.output_folder, "outputs/ 기본 폴더 사용 중")
 
         or_ = tk.Frame(out_card, bg=DARK2)
         or_.pack(fill="x", pady=(4, 0))
@@ -969,7 +1075,6 @@ class DroneApp(tk.Tk):
         opts = tk.Frame(parent, bg=DARK)
         opts.pack(fill="x", padx=10, pady=(4, 2))
         self._chk(opts, "하위 폴더 포함",    self.recursive_var)
-        self._chk(opts, "비교 이미지 저장",  self.save_compare)
         self._chk(opts, "기존 파일 덮어쓰기", self.overwrite_var)
 
     def _upd_path_lbl(self, lbl, var, placeholder):
@@ -986,58 +1091,97 @@ class DroneApp(tk.Tk):
         s.pack(fill="x", padx=10, pady=1)
         return s
 
+    def _toggle_adv_detect(self, event=None):
+        """고급 탐지 옵션 접기/펼치기."""
+        if self._adv_detect_open.get():
+            self._adv_detect_frame.pack_forget()
+            self._adv_detect_open.set(False)
+            self._adv_detect_btn.config(text="▶ 고급 탐지 옵션")
+        else:
+            self._adv_detect_frame.pack(fill="x", padx=10, pady=2)
+            self._adv_detect_open.set(True)
+            self._adv_detect_btn.config(text="▼ 고급 탐지 옵션")
+
     def _bind_slider_live(self, slider_widget):
-        """슬라이더 변경 시 실시간 미리보기 예약."""
+        """슬라이더 변경 시 실시간 처리 예약 (300ms debounce)."""
         slider_widget.var.trace_add("write", lambda *_: self._on_param_change())
 
     def _on_param_change(self):
-        """파라미터 변경 시 실시간 미리보기 예약 (debounce 600ms)."""
-        if not hasattr(self, '_live_roi_var'):
-            return
-        if not self._live_roi_var.get():
-            return
+        """파라미터 변경 시 실시간 처리 예약 (debounce 150ms). 현재 뷰 유지."""
         if not self._selected_path or not os.path.isfile(self._selected_path):
             return
         if not hasattr(self, '_cur_orig') or self._cur_orig is None:
             return
-        # 이전 예약 취소
+        # 이전 예약 취소 후 새로 예약
         if hasattr(self, '_live_timer_id') and self._live_timer_id is not None:
             try: self.after_cancel(self._live_timer_id)
             except Exception: pass
-        self._live_timer_id = self.after(600, self._live_preview_roi)
+        self._live_timer_id = self.after(150, self._live_preview_roi)
+
+    def _on_pan_done(self):
+        """패닝(드래그) 완료 후 현재 ROI로 즉시 재처리 (80ms 딜레이)."""
+        if not self._selected_path or not os.path.isfile(self._selected_path):
+            return
+        if not hasattr(self, '_cur_orig') or self._cur_orig is None:
+            return
+        if hasattr(self, '_live_timer_id') and self._live_timer_id is not None:
+            try: self.after_cancel(self._live_timer_id)
+            except Exception: pass
+        self._live_timer_id = self.after(80, self._live_preview_roi)
 
     def _live_preview_roi(self):
-        """보이는 영역만 즉시 처리하여 실시간 미리보기 반영."""
+        """보이는 ROI 영역만 처리 → 실시간 반영. 현재 탭/뷰 유지."""
         self._live_timer_id = None
         if self._is_previewing:
+            # 처리 중이면 50ms 후 재시도
+            self._live_timer_id = self.after(50, self._live_preview_roi)
             return
         if self._cur_orig is None:
             return
 
-        # 현재 보이는 ROI 좌표 가져오기
+        # 현재 활성 탭에 따라 ROI 계산
         roi = None
-        if hasattr(self, 'zoom_right') and self.zoom_right.get_viewport_image_rect():
-            roi = self.zoom_right.get_viewport_image_rect()
-        elif hasattr(self, 'zoom_single') and self.zoom_single.get_viewport_image_rect():
-            roi = self.zoom_single.get_viewport_image_rect()
+        try:
+            if self._active_tab == "compare" and hasattr(self, 'zoom_right'):
+                roi = self.zoom_right.get_viewport_image_rect()
+            elif self._active_tab in ("result", "orig") and hasattr(self, 'zoom_single'):
+                roi = self.zoom_single.get_viewport_image_rect()
+        except Exception:
+            roi = None
+
+        # ROI 여백 확장: 경계 아티팩트 방지용 (32px 패딩)
+        if roi is not None and self._cur_orig is not None:
+            orig_h, orig_w = self._cur_orig.shape[:2]
+            x1, y1, x2, y2 = roi
+            pad = 32
+            roi = (max(0, x1 - pad), max(0, y1 - pad),
+                   min(orig_w, x2 + pad), min(orig_h, y2 + pad))
+            # ROI가 전체 이미지와 거의 동일하면 None으로 처리 (전체 처리와 동일)
+            if (roi[2] - roi[0]) >= orig_w * 0.95 and (roi[3] - roi[1]) >= orig_h * 0.95:
+                roi = None
 
         params = self._collect_params()
-        params['roi_rect'] = roi
+        params['roi_rect']     = roi
         params['preview_mode'] = True
-        img = self._cur_orig
+        img    = self._cur_orig
+        fname  = os.path.basename(self._selected_path)
+        # 처리 전 현재 탭 기억
+        self._preview_tab_lock = self._active_tab
 
         self._is_previewing = True
+        self._set_status(f"처리 중: {fname} ...", WARN)
 
         def _work():
             try:
                 result, binary, soft, stats = process_single(img, **params)
                 self._queue.put(("preview_done",
-                                  img, result, binary, soft, stats,
-                                  os.path.basename(self._selected_path)))
+                                  img, result, binary, soft, stats, fname))
             except Exception as e:
                 import traceback
                 self._queue.put(("preview_error",
-                                  f"실시간 미리보기 오류: {e}\n{traceback.format_exc()[:400]}"))
+                                  f"처리 오류: {e}\n{traceback.format_exc()[:400]}"))
+            finally:
+                gc.collect()  # ★ 스레드 종료 시 gc 강제 실행
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -1326,7 +1470,7 @@ class DroneApp(tk.Tk):
         self.status_lbl = tk.Label(ft, text="준비", bg=DARK3, fg=TEXT2,
                                     font=("Segoe UI", 9), padx=10)
         self.status_lbl.pack(side="left", pady=3)
-        tk.Label(ft, text="v1.71  |  더블클릭: 즉시 처리  |  슬라이더 조정 → 미리보기 버튼으로 재처리",
+        tk.Label(ft, text="v1.74  |  더블클릭: 즉시 처리  |  슬라이더 조정 → 즉시 재처리",
                   bg=DARK3, fg=TEXT2, font=("Segoe UI", 8), padx=10
                   ).pack(side="right", pady=3)
         # 창 크기 변경 → compare 탭 재배치
@@ -1357,7 +1501,11 @@ class DroneApp(tk.Tk):
         if d:
             d = os.path.normpath(d)
             self.input_folder.set(d)
-            if not self.output_folder.get():
+            # output 폴더가 기본값(outputs/)인 경우는 그대로 유지
+            _base   = os.path.dirname(os.path.abspath(__file__))
+            _def_out = os.path.normpath(os.path.join(_base, "outputs"))
+            if not self.output_folder.get() or \
+               os.path.normpath(self.output_folder.get()) != _def_out:
                 self.output_folder.set(os.path.join(d, "output_restored"))
             self._log(f"입력 폴더: {d}", "info")
 
@@ -1391,13 +1539,14 @@ class DroneApp(tk.Tk):
             self._log("파일 더블클릭 → 즉시처리  |  미리보기 확인 후 [전체 처리]", "warn")
 
     def _on_file_select(self, event):
-        """단일 클릭: 원본 이미지 표시 (처리 없음)"""
+        """단일 클릭: 이미지 로드 후 즉시 실시간 처리 시작"""
         sel = self.file_listbox.curselection()
         if not sel: return
         idx = sel[0]
         if idx >= len(self._file_list): return
         path = self._file_list[idx]
 
+        # 같은 파일을 다시 클릭하면 재처리 (슬라이더 값이 바뀌었을 수 있음)
         self._selected_idx  = idx
         self._selected_path = path
 
@@ -1411,76 +1560,32 @@ class DroneApp(tk.Tk):
         self._cur_result = None
         self._cur_binary = None
         self._cur_soft   = None
+        self._first_load_done = False  # 새 파일 → 처리 완료 시 compare 탭으로 이동
 
-        # 원본 탭으로 전환
-        self._switch_tab("orig")
         h, w = img.shape[:2]
-        self._set_status(
-            f"선택: {os.path.basename(path)}  ({w}×{h})  |  더블클릭=즉시처리", ACC2)
+        self._set_status(f"처리 중: {os.path.basename(path)}  ({w}×{h})", WARN)
         self._prev_status.config(
-            text=f"선택: {os.path.basename(path)}\n크기: {w}×{h}\n\n"
-                 "더블클릭 또는 [미리보기] 버튼으로 처리", fg=WARN)
+            text=f"처리 중: {os.path.basename(path)}\n크기: {w}×{h}\n처리 완료 후 결과 표시",
+            fg=WARN)
+
+        # 즉시 처리 시작 (100ms 딜레이로 UI 먼저 갱신)
+        if hasattr(self, '_live_timer_id') and self._live_timer_id is not None:
+            try: self.after_cancel(self._live_timer_id)
+            except Exception: pass
+        self._live_timer_id = self.after(100, self._live_preview_roi)
 
     def _on_file_double(self, event):
-        """더블클릭: 즉시 미리보기 처리"""
-        # 더블클릭 시 ListboxSelect도 먼저 발생하므로 _selected_path가 이미 설정됨
-        if self._is_previewing:
-            self._log("⚠ 처리 중입니다. 완료 후 다시 시도하세요.", "warn")
-            return
-        if not self._selected_path:
-            return
-        # 이미지가 로드 안 됐을 경우 다시 로드
-        if self._cur_orig is None:
-            img = safe_imread(self._selected_path)
-            if img is None:
-                self._log(f"❌ 이미지 로드 실패: {os.path.basename(self._selected_path)}", "error")
-                return
-            self._cur_orig = img
-        self._preview_selected()
-
-    # ── 단일 미리보기 처리
+        """더블클릭: 클릭과 동일 (이미 클릭에서 처리 시작됨)"""
+        pass  # _on_file_select 에서 이미 처리 시작
 
     def _preview_selected(self):
-        """선택된 파일 1장 미리보기"""
-        if self._is_previewing:
-            self._log("⚠ 이미 처리 중입니다.", "warn"); return
+        """외부 호출 호환용 — 현재 선택 파일을 즉시 처리"""
         if not self._selected_path or not os.path.isfile(self._selected_path):
-            messagebox.showwarning("경고",
-                "파일 목록에서 이미지를 선택하거나 더블클릭하세요."); return
-
-        self._is_previewing = True
-        self.btn_preview.set_enabled(False)
-        fname = os.path.basename(self._selected_path)
-        self._prev_status.config(
-            text=f"처리 중: {fname}\n미리보기 모드 (빠른 처리)...", fg=WARN)
-        self._set_status(f"처리 중: {fname}", WARN)
-
-        params = self._collect_params()
-        path   = self._selected_path
-
-        def _work():
-            try:
-                img = safe_imread(path)
-                if img is None:
-                    self._queue.put(("preview_error",
-                                     f"이미지 로드 실패\n경로: {path}"))
-                    return
-                result, binary, soft, stats = process_single(
-                    img, **params, preview_mode=True)
-                self._queue.put(("preview_done",
-                                  img, result, binary, soft, stats,
-                                  os.path.basename(path)))
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                self._queue.put(("preview_error",
-                                  f"{type(e).__name__}: {e}\n{tb[:600]}"))
-            finally:
-                # finally 보장: 어떤 경우에도 플래그 해제
-                # (queue 처리에서도 해제하지만 예외 시 안전망)
-                pass
-
-        threading.Thread(target=_work, daemon=True).start()
+            return
+        if hasattr(self, '_live_timer_id') and self._live_timer_id is not None:
+            try: self.after_cancel(self._live_timer_id)
+            except Exception: pass
+        self._live_timer_id = self.after(0, self._live_preview_roi)
 
     # ── 전체 배치 처리
 
@@ -1505,7 +1610,6 @@ class DroneApp(tk.Tk):
         self._cancel_flag.clear()
         self.btn_start.set_enabled(False)
         self.btn_cancel.set_enabled(True)
-        self.btn_preview.set_enabled(False)
         for k in ("processed", "failed"):
             self._stat_vars[k].set("0")
         self._stat_vars["shadow_avg"].set("0.0 %")
@@ -1522,23 +1626,40 @@ class DroneApp(tk.Tk):
         self._cancel_flag.set()
         self._set_status("중단 요청 중...", WARN)
 
+    def _update_current_tab_image(self):
+        """현재 탭에 맞게 이미지 업데이트 (탭 전환 없이, 뷰 유지)."""
+        if self._active_tab == "compare":
+            if self._cur_result is not None:
+                self.zoom_right.load_image(cv2pil(self._cur_result), keep_view=True)
+            if self._cur_orig is not None:
+                self.zoom_left.load_image(cv2pil(self._cur_orig), keep_view=True)
+        elif self._active_tab == "result":
+            if self._cur_result is not None:
+                self.zoom_single.load_image(cv2pil(self._cur_result), keep_view=True)
+        elif self._active_tab == "orig":
+            if self._cur_orig is not None:
+                self.zoom_single.load_image(cv2pil(self._cur_orig), keep_view=True)
+
     def _collect_params(self):
         shadow_pct    = float(self.sl_shadow.get())     # 0~100 (%)
         highlight_pct = float(self.sl_highlight.get())  # 0~100 (%)
+        color_mode    = self.color_mode.get() if hasattr(self, 'color_mode') else 'gain'
         return {
             "detection_mode":     self.detect_mode.get(),
             "sensitivity":        float(self.sl_sensitivity.get()),
             "feather":            int(self.sl_feather.get()),
-            # v1.71 Shadow / Highlight % 파라미터
+            # v1.72 Shadow / Highlight % 파라미터
             "shadow_pct":         shadow_pct,
             "highlight_pct":      highlight_pct,
             "use_hue_consistent": bool(self.use_hue_consist.get()),
             "use_ai_color":       bool(self.use_ai_color.get()),
+            # 색상복원 모드 (v1.72)
+            "color_mode":         color_mode,
             # 품질 개선
             "denoise_h":          int(self.sl_denoise.get()),
             "sharpen_amount":     float(self.sl_sharpen.get()),
             "clahe_clip":         float(self.sl_clahe.get()),
-            # 하위 호환성 (구버전 대응 — shadow_strength=-1 → shadow_pct 우선)
+            # 하위 호환성 (shadow_strength=-1 → shadow_pct 우선)
             "shadow_strength":        -1.0,
             "highlight_strength":     -1.0,
             "color_restore_strength": shadow_pct / 100.0,
@@ -1580,18 +1701,19 @@ class DroneApp(tk.Tk):
                 result, binary, soft, stats = process_single(
                     img, **params, preview_mode=False)
                 cv2.imwrite(out_p, result)
-                if self.save_compare.get():
-                    cmp = make_compare(img, result, binary, soft)
-                    cv2.imwrite(
-                        os.path.join(out_dir, f"{stem}_compare.jpg"),
-                        cmp, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                del img; gc.collect()
-                return {"status": "ok", "fname": fname,
-                        "stats": stats, "result": result}
+                copy_exif(path, out_p)   # ★ 원본 EXIF/GPS/자세/카메라 메타 복사
+                del img, binary, soft, result  # ★ 즉시 해제 (메모리 누수 방지)
+                gc.collect()
+                return {"status": "ok", "fname": fname, "stats": stats}
             except Exception as e:
+                del img
+                gc.collect()
                 return {"status": "fail", "fname": fname, "msg": str(e)}
 
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        # ★ 워커 수 안전 상한: 1장당 ~100MB 사용. 64GB 기준 최대 4개 권장
+        # 사용자가 높은 값 설정 시에도 메모리 보호를 위해 4로 제한
+        safe_workers = min(n_workers, 4)
+        with ThreadPoolExecutor(max_workers=safe_workers) as ex:
             futs = {ex.submit(_one, f): f for f in files}
             for fut in as_completed(futs):
                 if self._cancel_flag.is_set(): break
@@ -1608,7 +1730,6 @@ class DroneApp(tk.Tk):
                     self._queue.put(("stats_update", done, failed,
                         sum(shadow_list) / len(shadow_list),
                         sum(speed_list)  / len(speed_list), elapsed))
-                    self._queue.put(("batch_preview", None, r.get("result")))
                 elif r["status"] == "skip":
                     self._queue.put(("progress", done, total, r["fname"],
                         f"건너뜀 {r['fname']}"))
@@ -1623,6 +1744,9 @@ class DroneApp(tk.Tk):
         elapsed_final = time.time() - t_start
         self._queue.put(("done", done, failed, elapsed_final,
                           self._cancel_flag.is_set()))
+        # ★ 배치 완료 후 통계 리스트 명시 해제
+        del shadow_list, speed_list
+        gc.collect()
 
     # ── 큐 폴링 (메인 스레드)
 
@@ -1649,17 +1773,28 @@ class DroneApp(tk.Tk):
 
                 elif kind == "preview_done":
                     _, orig, result, binary, soft, stats, fname = msg
-                    # 플래그 해제 (연속 처리 가능)
+                    # 플래그 해제
                     self._is_previewing = False
-                    self.btn_preview.set_enabled(True)
 
+                    # ★ 이전 대형 배열 명시적 해제 후 교체
+                    for attr in ('_cur_orig', '_cur_result', '_cur_binary', '_cur_soft'):
+                        old = getattr(self, attr, None)
+                        if old is not None:
+                            del old
                     self._cur_orig   = orig
                     self._cur_result = result
                     self._cur_binary = binary
                     self._cur_soft   = soft
 
-                    # 비교 탭으로 전환 후 이미지 표시
-                    self._switch_tab("compare")
+                    # 탭 전환 로직:
+                    # - 처음 파일 로드 시 → compare 탭으로 전환
+                    # - 이미 결과가 표시된 상태에서 슬라이더/패닝 변경 → 현재 탭 유지
+                    if not getattr(self, '_first_load_done', False):
+                        self._first_load_done = True
+                        self._switch_tab("compare")
+                    else:
+                        # 현재 탭에서 이미지만 갱신 (탭 전환 없음)
+                        self._update_current_tab_image()
 
                     # 통계 업데이트
                     self._prev_vars["shadow_pct"].set(f"{stats.get('shadow_pct', 0):.1f} %")
@@ -1667,15 +1802,15 @@ class DroneApp(tk.Tk):
                     self._prev_vars["restore_ms"].set(f"{stats.get('restore_ms', 0):.0f} ms")
                     self._prev_vars["total_ms"].set(f"{stats.get('total_ms', 0):.0f} ms")
                     self._prev_status.config(
-                        text=f"✅ 완료: {fname}\n"
+                        text=f"✅ {fname}\n"
                              f"그림자: {stats.get('shadow_pct', 0):.1f}%  "
-                             f"처리: {stats.get('total_ms', 0):.0f}ms\n\n"
-                             "결과 확인 후 슬라이더 조정→재처리\n또는 [전체 처리] 버튼 클릭",
+                             f"처리: {stats.get('total_ms', 0):.0f}ms\n"
+                             "슬라이더 조정 시 자동 재처리",
                         fg=GREEN)
                     self._set_status(
-                        f"미리보기 완료: {fname}  "
-                        f"| 그림자 {stats.get('shadow_pct', 0):.1f}%  "
-                        f"| {stats.get('total_ms', 0):.0f}ms",
+                        f"✅ {fname}  "
+                        f"그림자 {stats.get('shadow_pct', 0):.1f}%  "
+                        f"{stats.get('total_ms', 0):.0f}ms",
                         GREEN)
                     self._log(
                         f"✅ 미리보기: {fname} | 그림자 {stats.get('shadow_pct', 0):.1f}% | "
@@ -1686,11 +1821,10 @@ class DroneApp(tk.Tk):
                 elif kind == "preview_error":
                     _, err = msg
                     self._is_previewing = False
-                    self.btn_preview.set_enabled(True)
                     self._prev_status.config(
                         text=f"❌ 오류: {err[:120]}", fg=RED)
-                    self._set_status("미리보기 실패", RED)
-                    self._log(f"❌ 미리보기 오류:\n{err[:400]}", "error")
+                    self._set_status("실시간 처리 실패", RED)
+                    self._log(f"❌ 실시간 오류:\n{err[:400]}", "error")
 
                 elif kind == "progress":
                     _, done, total, fname, log_msg = msg
@@ -1712,24 +1846,11 @@ class DroneApp(tk.Tk):
                     m, s = divmod(int(elapsed), 60)
                     self._stat_vars["elapsed"].set(f"{m:02d}:{s:02d}")
 
-                elif kind == "batch_preview":
-                    _, orig, result = msg
-                    if orig   is not None: self._cur_orig   = orig
-                    if result is not None: self._cur_result = result
-                    # 현재 탭에 맞게 업데이트
-                    if self._active_tab == "compare":
-                        if result is not None:
-                            self.zoom_right.load_image(cv2pil(result))
-                    elif self._active_tab == "result":
-                        if result is not None:
-                            self.zoom_single.load_image(cv2pil(result))
-
                 elif kind == "done":
                     _, done, failed, elapsed, cancelled = msg
                     self._is_running = False
                     self.btn_start.set_enabled(True)
                     self.btn_cancel.set_enabled(False)
-                    self.btn_preview.set_enabled(True)
                     m, s = divmod(int(elapsed), 60)
                     if cancelled:
                         self._set_status(f"중단됨  |  완료 {done}장", WARN)
@@ -1755,6 +1876,10 @@ class DroneApp(tk.Tk):
     def _log(self, text, tag="info"):
         self.log_text.config(state="normal")
         self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n", tag)
+        # ★ 최대 500줄 유지 (무한 누적 방지)
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 500:
+            self.log_text.delete("1.0", f"{lines - 500}.0")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 

@@ -1,5 +1,5 @@
 """
-Processing Pipeline  – 드론 사진 그림자 제거 + 색상 복원  v1.71
+Processing Pipeline  – 드론 사진 그림자 제거 + 색상 복원  v1.74
 
 처리 경로:
   preview_mode=True  → 최대 800px 썸네일로 처리 (즉각 미리보기용, < 500ms 목표)
@@ -25,6 +25,52 @@ from color_restoration import (
     restore_shadow_color,
     analyze_image,
 )
+
+
+# ──────────────────────────────────────────────────────────
+# EXIF 복사 유틸리티  (piexif 우선, PIL fallback)
+# ──────────────────────────────────────────────────────────
+
+def copy_exif(src_path: str, dst_path: str) -> bool:
+    """
+    src_path 원본 이미지의 모든 EXIF/메타데이터(GPS, 드론 자세, 카메라 정보 등)를
+    dst_path 처리 결과 이미지에 그대로 복사합니다.
+
+    지원 형식: JPEG/JPG (piexif), TIFF (piexif), PNG/기타 (piexif 미지원 시 생략)
+    Returns: True = 성공, False = EXIF 없음 또는 미지원 형식
+    """
+    ext = Path(src_path).suffix.lower()
+    if ext not in ('.jpg', '.jpeg', '.tif', '.tiff'):
+        return False  # PNG 등은 EXIF 없음, 무시
+
+    # ── 방법 1: piexif (JPEG/TIFF 모두 지원, 가장 정확)
+    try:
+        import piexif
+        exif_dict = piexif.load(src_path)
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, dst_path)
+        return True
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # ── 방법 2: PIL/Pillow fallback (JPEG only)
+    if ext in ('.jpg', '.jpeg'):
+        try:
+            from PIL import Image
+            src_img = Image.open(src_path)
+            exif_data = src_img.info.get('exif', b'')
+            src_img.close()
+            if exif_data:
+                dst_img = Image.open(dst_path)
+                dst_img.save(dst_path, exif=exif_data, quality=95, subsampling=0)
+                dst_img.close()
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
 # ──────────────────────────────────────────────────────────
@@ -90,7 +136,7 @@ def load_models(model_dir: str = "models") -> Dict[str, bool]:
 # 단일 이미지 처리
 # ──────────────────────────────────────────────────────────
 
-PREVIEW_MAX_PX = 800   # 미리보기용 최대 픽셀 (한 변 기준)
+PREVIEW_MAX_PX = 0     # v1.77: ROI 원본 해상도 처리 (축소 없음)
 BATCH_MAX_PX   = 0     # 배치 저장용 (0 = 무제한)
 
 
@@ -115,11 +161,12 @@ def process_single(
     detection_mode: str   = 'hybrid',
     sensitivity: float    = 0.45,
     feather: int          = 20,
-    # v1.71 Shadow / Highlight 파라미터 (0~100%)
+    # v1.74 Shadow / Highlight 파라미터 (0~100%)
     shadow_pct: float             = 85.0,  # Shadow 복원 강도 (0=원본, 100=완전복원)
     highlight_pct: float          = 30.0,  # Highlight 복원 강도 (0=원본, 100=최대)
     use_hue_consistent: bool      = True,  # Hue 기반 정밀 색상 복원
     use_ai_color: bool            = True,
+    color_mode: str               = 'gain',  # 색상복원 모드: 'gain'|'retinex'|'wb'|'gamma'
     # 품질 개선
     denoise_h: int                = 4,
     sharpen_amount: float         = 0.7,
@@ -143,7 +190,7 @@ def process_single(
     preview_mode: bool            = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
-    단일 이미지 처리 v1.71.
+    단일 이미지 처리 v1.73.
     Returns: (result_bgr, binary_mask, soft_mask, stats_dict)
 
     preview_mode=True  : PREVIEW_MAX_PX 이하로 처리 후 원본 크기로 upscale 반환
@@ -154,17 +201,23 @@ def process_single(
     orig_h, orig_w = img_bgr.shape[:2]
 
     # ── 처리 해상도 결정
-    max_px   = PREVIEW_MAX_PX if preview_mode else BATCH_MAX_PX
-    work_img, scale = _resize_for_processing(img_bgr, max_px)
-    wh, ww = work_img.shape[:2]
-
-    # roi_rect를 작업 해상도로 변환
-    work_roi = None
-    if roi_rect is not None and scale < 1.0:
+    # v1.77: preview_mode일 때도 ROI를 원본 해상도로 처리 (썸네일 축소 폐지)
+    # roi_rect가 있으면 해당 영역만 원본 픽셀로 잘라서 처리 → 선명한 미리보기
+    if preview_mode and roi_rect is not None:
+        # ROI 원본 픽셀 크롭
         x1, y1, x2, y2 = roi_rect
-        work_roi = (int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale))
-    elif roi_rect is not None:
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(orig_w, x2), min(orig_h, y2)
+        work_img = img_bgr[y1:y2, x1:x2].copy()
+        work_roi = None   # 크롭 후 처리 → roi 불필요
+        _cropped = True
+    else:
+        max_px   = PREVIEW_MAX_PX if preview_mode else BATCH_MAX_PX
+        work_img, _scale = _resize_for_processing(img_bgr, max_px)
         work_roi = roi_rect
+        _cropped = False
+
+    wh, ww = work_img.shape[:2]
 
     # ── 1. 그림자 탐지 (work 해상도)
     t0 = time.perf_counter()
@@ -182,13 +235,12 @@ def process_single(
     stats['detect_ms']    = stats['detection_ms']
     stats['shadow_pct']   = round(float((binary > 0).sum()) / max(wh * ww, 1) * 100, 1)
 
-    # ── 2. 색상 복원 (v1.71: 적응형 분석 + Shadow/Highlight % 제어)
+    # ── 2. 색상 복원
     t0 = time.perf_counter()
     ai_model = _color_model if use_ai_color else None
 
     # 하위 호환성: 구버전 0~1.0 파라미터를 % 변환
     if shadow_strength >= 0:
-        # 구버전 파라미터가 명시적으로 전달된 경우
         eff_shadow_pct = max(shadow_pct,
                               shadow_strength * 100.0,
                               color_restore_strength * 100.0,
@@ -208,9 +260,10 @@ def process_single(
         result = _process_roi(
             work_img, soft,
             roi_rect           = work_roi,
-            shadow_strength    = eff_shadow_pct,    # 퍼센트 (0~100)
-            highlight_strength = eff_highlight_pct, # 퍼센트 (0~100)
+            shadow_strength    = eff_shadow_pct,
+            highlight_strength = eff_highlight_pct,
             use_hue_consistent = use_hue_consistent,
+            color_mode         = color_mode,
             ai_model           = ai_model,
             device             = _device,
             denoise_h          = denoise_h,
@@ -228,11 +281,22 @@ def process_single(
     stats['preview_mode']   = preview_mode
     stats['work_size']      = f"{ww}×{wh}"
 
-    # ── 3. 미리보기 모드: 결과를 원본 크기로 upscale
-    if scale < 1.0:
-        result = cv2.resize(result, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-        binary = cv2.resize(binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        soft   = cv2.resize(soft,   (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+    # ── 3. ROI 크롭 처리 결과를 원본 크기 이미지에 붙여넣기
+    if _cropped:
+        x1, y1, x2, y2 = roi_rect
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(orig_w, x2), min(orig_h, y2)
+        # result_full: 원본과 동일 크기, ROI 밖은 원본 픽셀 유지
+        result_full = img_bgr.copy()
+        result_full[y1:y2, x1:x2] = result
+        result = result_full
+        # binary/soft도 원본 크기로
+        binary_full = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        binary_full[y1:y2, x1:x2] = binary
+        binary = binary_full
+        soft_full = np.zeros((orig_h, orig_w), dtype=np.float32)
+        soft_full[y1:y2, x1:x2] = soft
+        soft = soft_full
 
     return result, binary, soft, stats
 
@@ -256,41 +320,3 @@ def scan_folder_recursive(folder: str) -> list:
     return [str(f) for f in sorted(p.rglob('*'))
             if f.is_file() and f.suffix in SUPPORTED_EXT]
 
-
-# ──────────────────────────────────────────────────────────
-# 비교 이미지 생성
-# ──────────────────────────────────────────────────────────
-
-def make_compare(orig: np.ndarray,
-                  result: np.ndarray,
-                  binary: np.ndarray,
-                  soft: np.ndarray) -> np.ndarray:
-    """4-panel: 원본 | 그림자 마스크 | 복원 | Diff×3"""
-    h, w = orig.shape[:2]
-
-    mask_vis = orig.copy()
-    overlay  = np.zeros_like(orig)
-    overlay[binary > 0] = [0, 80, 255]
-    mask_vis = cv2.addWeighted(mask_vis, 0.55, overlay, 0.45, 0)
-
-    diff = np.clip(
-        (result.astype(np.int32) - orig.astype(np.int32)) * 3 + 128,
-        0, 255).astype(np.uint8)
-
-    font  = cv2.FONT_HERSHEY_SIMPLEX
-    sc    = max(0.45, min(1.1, w / 900))
-    thick = max(1, int(sc * 2))
-
-    def label(img, text, col=(255, 255, 255)):
-        out = img.copy()
-        (tw, th), _ = cv2.getTextSize(text, font, sc, thick)
-        cv2.rectangle(out, (6, 6), (16 + tw, 18 + th), (0, 0, 0), -1)
-        cv2.putText(out, text, (11, 11 + th), font, sc, col, thick, cv2.LINE_AA)
-        return out
-
-    return cv2.hconcat([
-        label(orig,     "Original",    (200, 200, 200)),
-        label(mask_vis, "Shadow Mask", (0, 160, 255)),
-        label(result,   "Restored",    (80, 255, 80)),
-        label(diff,     "Diff x3",     (255, 200, 80)),
-    ])
